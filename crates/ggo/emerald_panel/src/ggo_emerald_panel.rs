@@ -49,6 +49,7 @@
 //! resolved), and [`tileset`] is the one artifact this panel writes itself
 //! rather than delegating to `emd`. This module is the gpui glue.
 
+mod add_system_modal;
 mod forms;
 mod generate_modal;
 mod lock;
@@ -80,6 +81,7 @@ use ggo_worldlib::emerald::{
     system_ref, verify_emd_result, with_cadence,
 };
 
+pub use add_system_modal::AddSystemModal;
 use forms::{ASSET_KIND, FIELD_KINDS, FieldDraft, GenDraft, GenKind};
 pub use generate_modal::GenerateModal;
 use lock::{BinProbe, EMD_LOCK_POLL_INTERVAL, LockCheck, LockProbe};
@@ -146,18 +148,31 @@ const CADENCES: [u32; 8] = [1, 2, 3, 4, 6, 8, 12, 16];
 /// into scrolling.
 const BROWSER_MIN_HEIGHT: Pixels = px(120.);
 
-/// The tallest the run state is allowed to get. `emd`'s transcript is
+/// How tall the run-state section starts. `emd`'s transcript is
 /// unbounded (a failing `cargo check` is dozens of lines), and the run
 /// state sits below the browser in the same column: uncapped, one bad run
 /// takes the whole pane and the browser is left with its floor.
-const RUN_STATE_MAX_HEIGHT: Pixels = px(240.);
+///
+/// It is a DEFAULT rather than a cap in the dock -- the divider above the
+/// section moves it, within the clamps -- and still the cap inside the
+/// generate modal, where there is no divider to move.
+const RUN_STATE_DEFAULT_HEIGHT: Pixels = px(240.);
+
+/// The shortest a dragged run-state section may be left: enough for the
+/// status line that is the point of the section at all. Without a floor
+/// the handle could be dragged past the bottom edge, leaving nothing to
+/// grab and no way back.
+const RUN_STATE_MIN_HEIGHT: Pixels = px(48.);
+
+/// The divider grab strip's thickness, `workspace::dock`'s own figure.
+const DIVIDER_SIZE: Pixels = px(6.);
 
 /// Empty-state text -- shown when there is nothing to list and no run to
 /// report, i.e. an unmanaged project (or one whose manifests are still
 /// empty), where work can only arrive by right-clicking a directory.
 /// (An open generate form is not part of that test: it is drawn in a
 /// modal over the window, never here.)
-const EMPTY_MESSAGE: &str = "Right-click a project directory → New Component…/New Module…, a module directory → New Component… in it, or an assets directory → New World…";
+const EMPTY_MESSAGE: &str = "Right-click a project directory → New Component…/New Module…/New World…/New Tileset…, or a module directory → New Component… in it";
 
 pub fn init(cx: &mut App) {
     // Right-clicking a directory offers the generate entries that belong
@@ -345,7 +360,7 @@ fn new_project_request(dest: &Path) -> Option<(EmdRequest, PathBuf)> {
 ///
 /// | right-clicked directory        | entries |
 /// |--------------------------------|---------|
-/// | any project directory outside `assets/` and modules | New Component… / New System… / New Schedule… / New Module… |
+/// | any project directory outside `assets/` and modules | New Component… / New System… / New Schedule… / New Module… / New World… / New Tileset… |
 /// | inside a module -- `src/modules/<name>/` or below | New Component… / New System… / New Schedule…, with `<name>` prefilled as the module |
 /// | the project's `assets/`, or anything under it | New World… / New Tileset… |
 /// | anything else                  | none |
@@ -357,10 +372,12 @@ fn new_project_request(dest: &Path) -> Option<(EmdRequest, PathBuf)> {
 /// it is the one artifact that has to exist before the module-scoped
 /// entries above can name it. It is offered only where a module can be
 /// created from nothing -- not inside a module, where the three scoped
-/// entries belong instead. `New World…` sits with the
-/// assets entries because a world is an asset file -- the clicked
-/// directory inside `assets/` becomes `emd generate world`'s `--dir`, so
-/// the click chooses both the project and the destination.
+/// entries belong instead. `New World…`/`New Tileset…` are offered
+/// wherever the generate entries are AND throughout `assets/`: a click
+/// inside the asset tree becomes the destination (`emd generate world`'s
+/// `--dir`, the tileset's directory), and a click anywhere else in the
+/// project aims at the asset root -- which is what makes them reachable
+/// in a checkout that has no `assets/` yet.
 ///
 /// MUST NOT touch the project panel or any GGO panel: contributors run
 /// while `ProjectPanel` is leased (see
@@ -427,29 +444,33 @@ fn contribute_emerald_menu(
             );
         }
     }
-    if is_assets_dir(&dir) {
-        if let Some(seed) = world_seed(&dir, &worktree_root, &rel) {
+    // The asset entries sit wherever the generate entries do, not only
+    // inside `assets/`. Gating them on the asset tree made them
+    // unreachable in exactly the project that needs them most -- a fresh
+    // checkout has no `assets/` to right-click, so there was no way to
+    // author its first world or tileset at all. Both still LAND in the
+    // asset tree ([`asset_seed`]); only where they can be asked for
+    // changed. Modules stay excluded: the three module-scoped generate
+    // entries are what belongs there.
+    if is_generate_dir(&dir) || is_assets_dir(&dir) {
+        if let Some(seed) = asset_seed(&dir, &worktree_root, &rel) {
             items.push(
                 ui::ContextMenuEntry::new("New World…")
                     .icon(ui::IconName::Plus)
                     .handler(new_world_inline_handler(
                         cx.weak_entity(),
                         path.worktree_id,
-                        seed,
+                        seed.clone(),
                     ))
                     .into(),
             );
-        }
-        if let Some(under) = tileset_under(&dir) {
             items.push(
                 ui::ContextMenuEntry::new("New Tileset…")
                     .icon(ui::IconName::Plus)
                     .handler(new_tileset_inline_handler(
                         cx.weak_entity(),
                         path.worktree_id,
-                        rel,
-                        dir.clone(),
-                        under,
+                        seed,
                     ))
                     .into(),
             );
@@ -458,31 +479,41 @@ fn contribute_emerald_menu(
     items
 }
 
-/// Everything the inline "New World…" edit needs, computed while the
-/// contributor runs (path math plus the same kind of fs stats the menu
-/// predicates already make -- no panel is touched).
+/// Everything an inline "New World…"/"New Tileset…" edit needs, computed
+/// while the contributor runs (path math plus the same kind of fs stats
+/// the menu predicates already make -- no panel is touched).
+///
+/// One seed for both entries because both answer the same question the
+/// same way: an asset file lands under the project's `assets/`, at the
+/// clicked directory when that is already inside it and at the asset
+/// root otherwise.
 #[derive(Clone)]
-struct WorldSeed {
+struct AssetSeed {
     /// Worktree-relative dir the inline editor is seeded under: the
     /// clicked dir when it is `assets` or below it, else the project's
     /// `assets`.
     seed_rel: String,
-    /// The clicked dir, as the seed when `seed_rel` does not exist on
-    /// disk yet -- `emd` creates `assets/` on the first world.
+    /// The clicked dir, as the seed when `seed_rel` does not exist in the
+    /// worktree yet -- the commit creates the asset dir (`emd` does for a
+    /// world, [`tileset::create_blank_tileset`] for a tileset).
     fallback_rel: String,
     /// `--dir` prefix `seed_rel` sits at below `assets` (empty at the
-    /// asset root or for the fallback).
+    /// asset root or for a click outside the asset tree).
     base_sub: String,
-    /// Absolute `assets`, for the collision pre-check.
+    /// Absolute `assets`, for the collision pre-check. NOT required to
+    /// exist: a project can be offered its first asset.
     assets_abs: PathBuf,
+    /// The absolute directory the file lands in -- `assets_abs` joined
+    /// with `base_sub`.
+    dir_abs: PathBuf,
     /// Absolute emerald project root the run executes in.
     project_dir: PathBuf,
 }
 
-fn world_seed(dir: &Path, worktree_root: &Path, rel: &str) -> Option<WorldSeed> {
+fn asset_seed(dir: &Path, worktree_root: &Path, rel: &str) -> Option<AssetSeed> {
     let project_dir = emerald_project_root(dir)?;
     let assets_abs = project_dir.join(ASSETS_DIR);
-    let (seed_abs, base_sub) = match dir.strip_prefix(&assets_abs) {
+    let (dir_abs, base_sub) = match dir.strip_prefix(&assets_abs) {
         Ok(sub) => (
             dir.to_path_buf(),
             sub.to_string_lossy()
@@ -490,31 +521,19 @@ fn world_seed(dir: &Path, worktree_root: &Path, rel: &str) -> Option<WorldSeed> 
         ),
         Err(_) => (assets_abs.clone(), String::new()),
     };
-    let seed_rel = seed_abs
+    let seed_rel = dir_abs
         .strip_prefix(worktree_root)
         .ok()?
         .to_string_lossy()
         .replace(std::path::MAIN_SEPARATOR, "/");
-    Some(WorldSeed {
+    Some(AssetSeed {
         seed_rel,
         fallback_rel: rel.to_string(),
         base_sub,
         assets_abs,
+        dir_abs,
         project_dir,
     })
-}
-
-/// The `dir_rel`-inside-its-asset-root prefix a tileset typed in this
-/// directory gets, or `None` outside an asset root (cannot happen when
-/// [`is_assets_dir`] just passed, but the walk can be re-run cheaply).
-fn tileset_under(dir: &Path) -> Option<String> {
-    let asset_root = emerald_asset_root(dir)?;
-    Some(
-        dir.strip_prefix(&asset_root)
-            .ok()?
-            .to_string_lossy()
-            .replace(std::path::MAIN_SEPARATOR, "/"),
-    )
 }
 
 use ggo_common::inline_project_path;
@@ -561,7 +580,7 @@ fn new_item_handler(
 fn new_world_inline_handler(
     workspace: WeakEntity<Workspace>,
     worktree_id: project::WorktreeId,
-    seed: WorldSeed,
+    seed: AssetSeed,
 ) -> impl Fn(&mut Window, &mut App) + 'static {
     ggo_common::panel_entry_handler(
         workspace.clone(),
@@ -603,7 +622,7 @@ fn new_world_inline_handler(
 /// ([`forms::world_name_error`]) plus a does-it-already-exist pre-check,
 /// so Enter never spawns a run the CLI would reject and the collision
 /// message appears while typing rather than as a failed run.
-fn world_validate(seed: &WorldSeed) -> impl Fn(&str) -> Option<String> + 'static {
+fn world_validate(seed: &AssetSeed) -> impl Fn(&str) -> Option<String> + 'static {
     let assets_abs = seed.assets_abs.clone();
     let base_sub = seed.base_sub.clone();
     move |typed| {
@@ -633,7 +652,7 @@ fn world_validate(seed: &WorldSeed) -> impl Fn(&str) -> Option<String> + 'static
 /// reveal-then-act shape is exactly what a menu entry does.
 fn new_world_commit(
     workspace: WeakEntity<Workspace>,
-    seed: WorldSeed,
+    seed: AssetSeed,
 ) -> impl FnOnce(String, &mut Window, &mut App) + 'static {
     move |typed, window, cx| {
         let (dirs, name) = forms::split_world_name(&typed);
@@ -660,35 +679,32 @@ fn new_world_commit(
 }
 
 /// The "New Tileset…" entry's handler -- inline like
-/// [`new_world_inline_handler`], committing through
-/// [`EmeraldPanel::create_tileset_inline`]. The blank pair is written in
-/// the CLICKED directory (`under` inside its asset root), so no `--dir`
-/// analog is involved.
+/// [`new_world_inline_handler`], and with the same fallback: the blank
+/// pair is written in [`AssetSeed::dir_abs`] whether or not the asset
+/// tree exists yet, so a seed that cannot be placed in the worktree
+/// still commits to the right directory.
 fn new_tileset_inline_handler(
     workspace: WeakEntity<Workspace>,
     worktree_id: project::WorktreeId,
-    dir_rel: String,
-    dir_abs: PathBuf,
-    under: String,
+    seed: AssetSeed,
 ) -> impl Fn(&mut Window, &mut App) + 'static {
     ggo_common::panel_entry_handler(
         workspace.clone(),
         move |panel: &Entity<ProjectPanel>, window, cx| {
             let workspace = workspace.clone();
-            let dir_rel = dir_rel.clone();
-            let dir_abs = dir_abs.clone();
-            let under = under.clone();
+            let seed = seed.clone();
             panel.update(cx, |panel, cx| {
-                let Some(path) = inline_project_path(worktree_id, &dir_rel) else {
-                    return;
-                };
-                panel.ggo_new_entry_inline(
-                    &path,
-                    tileset_validate(dir_abs, under),
-                    new_tileset_commit(workspace, dir_rel.clone()),
-                    window,
-                    cx,
-                );
+                let commit = || new_tileset_commit(workspace.clone(), seed.seed_rel.clone());
+                let validate = || tileset_validate(seed.dir_abs.clone(), seed.base_sub.clone());
+                let seeded = inline_project_path(worktree_id, &seed.seed_rel).is_some_and(|path| {
+                    panel.ggo_new_entry_inline(&path, validate(), commit(), window, cx)
+                });
+                if !seeded {
+                    let Some(path) = inline_project_path(worktree_id, &seed.fallback_rel) else {
+                        return;
+                    };
+                    panel.ggo_new_entry_inline(&path, validate(), commit(), window, cx);
+                }
             });
         },
     )
@@ -1047,16 +1063,55 @@ fn module_under(dir: &Path) -> Option<String> {
 }
 
 /// Walk up from `dir` (inclusive) to the nearest emerald project root,
-/// returning that project's `assets/` dir. Same helper (and same
-/// directory-inclusive start) as `ggo_sprite_panel`'s `asset_root_of_dir`.
+/// returning that project's `assets/` dir -- **whether or not it exists
+/// yet**, because the asset entries are offered on projects that have
+/// never made one.
+fn emerald_asset_dir(dir: &Path) -> Option<PathBuf> {
+    Some(emerald_project_root(dir)?.join(ASSETS_DIR))
+}
+
+/// [`emerald_asset_dir`], but only for an asset tree that is really on
+/// disk -- which is what makes "is this directory INSIDE the asset tree"
+/// answerable. Same helper (and same directory-inclusive start) as
+/// `ggo_sprite_panel`'s `asset_root_of_dir`.
 fn emerald_asset_root(dir: &Path) -> Option<PathBuf> {
-    let assets = emerald_project_root(dir)?.join(ASSETS_DIR);
-    assets.is_dir().then_some(assets)
+    emerald_asset_dir(dir).filter(|assets| assets.is_dir())
 }
 
 /// Is `dir` the asset root of an emerald project, or a directory under it?
 fn is_assets_dir(dir: &Path) -> bool {
     emerald_asset_root(dir).is_some_and(|assets| dir.starts_with(&assets))
+}
+
+/// The one session-only divider this panel has, mid-drag.
+/// `workspace::DraggedDock`'s shape: the state rides on the drag and the
+/// ghost renders nothing, because the visible feedback is the resized
+/// layout, not a floating chip.
+///
+/// The [`gpui::EntityId`] is the panel the handle belongs to, and it is
+/// load bearing: `on_drag_move` fires in the CAPTURE phase on every
+/// mounted listener whose drag type matches, with no hitbox test, so a
+/// drag in one emerald dock would otherwise resize every open one.
+#[derive(Clone, Copy)]
+struct DraggedDivider(gpui::EntityId);
+
+impl Render for DraggedDivider {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+/// Resolve a divider drag at window position `position` into the run
+/// state's new height, clamped so the browser keeps its floor.
+///
+/// Measured UP from `body`'s bottom edge, which the run state sits
+/// against: the section's own top follows the drag, so it cannot be the
+/// edge the height is measured from.
+///
+/// Pure, so the clamps are provable without a window.
+fn divider_size(position: gpui::Point<Pixels>, body: gpui::Bounds<Pixels>) -> Pixels {
+    let max = (body.size.height - BROWSER_MIN_HEIGHT).max(RUN_STATE_MIN_HEIGHT);
+    (body.bottom() - position.y).clamp(RUN_STATE_MIN_HEIGHT, max)
 }
 
 // ------------------------------------------------------------- view state
@@ -1248,6 +1303,21 @@ pub struct EmeraldPanel {
     /// asserted as a call count.
     probe: LockProbe,
     run_state: RunState,
+    /// Whether the run-state section is open or collapsed to its title
+    /// row. Session-only, like the divider -- and re-opened by
+    /// [`EmeraldPanel::start_run`] when a run starts over a hidden
+    /// FAILURE, so the eye can never swallow the answer to "did that
+    /// work?".
+    run_state_visible: bool,
+    /// The run-state section's dragged height; `None` is
+    /// [`RUN_STATE_DEFAULT_HEIGHT`]. Session-only, like every other GGO
+    /// panel's dividers: how this pane is split is a view preference of
+    /// this session, not of the project.
+    run_state_height: Option<Pixels>,
+    /// The body column's on-screen bounds, recorded at prepaint -- the
+    /// frame a divider drag resolves in, and the height a stored
+    /// `run_state_height` is re-clamped against.
+    body_bounds: std::rc::Rc<std::cell::RefCell<Option<gpui::Bounds<Pixels>>>>,
     run_generation: u64,
     _run_task: Option<Task<()>>,
     _confirm_task: Option<Task<()>>,
@@ -1288,6 +1358,9 @@ impl EmeraldPanel {
             emd_probe: BinProbe::Unprobed,
             probe: lock::system_probe(),
             run_state: RunState::Idle,
+            run_state_visible: true,
+            run_state_height: None,
+            body_bounds: std::rc::Rc::new(std::cell::RefCell::new(None)),
             run_generation: 0,
             _run_task: None,
             _confirm_task: None,
@@ -1410,6 +1483,34 @@ impl EmeraldPanel {
         }));
     }
 
+    /// Apply one step of a divider drag. Drops out before `notify` when
+    /// the clamped size is the one already in force -- a drag emits a
+    /// move event per mouse position, most of which land in the same
+    /// pixel row once a clamp is biting.
+    fn drag_divider(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(body) = *self.body_bounds.borrow() else {
+            return;
+        };
+        let size = divider_size(position, body);
+        if self.run_state_height.replace(size) != Some(size) {
+            cx.notify();
+        }
+    }
+
+    /// The run-state section's height AS RENDERED: the dragged height (or
+    /// [`RUN_STATE_DEFAULT_HEIGHT`]) re-clamped against the body's current
+    /// height. [`Self::drag_divider`] clamps against the height at drag
+    /// time, but the pane can be shortened afterwards -- without this the
+    /// section would swallow the browser's floor and take the handle off
+    /// the column with it, where it could not be dragged back.
+    fn rendered_run_state_height(&self) -> Pixels {
+        let height = self.run_state_height.unwrap_or(RUN_STATE_DEFAULT_HEIGHT);
+        let Some(body) = *self.body_bounds.borrow() else {
+            return height;
+        };
+        height.min((body.size.height - BROWSER_MIN_HEIGHT).max(RUN_STATE_MIN_HEIGHT))
+    }
+
     /// Whether an `emd` mutation may start right now: the version lock
     /// allows it and no run is already in flight.
     ///
@@ -1418,6 +1519,20 @@ impl EmeraldPanel {
     /// clickable and an action that actually runs cannot disagree.
     fn mutations_blocked(&self) -> bool {
         self.running() || !lock::mutations_enabled(&self.lock)
+    }
+
+    /// Why a disabled mutating control is disabled, for its tooltip --
+    /// `None` when nothing is blocking.
+    ///
+    /// The lock half is [`lock::lock_message`], the banner's own leading
+    /// line, deliberately rather than a second wording: a tooltip that
+    /// explained the drift differently from the banner three rows above
+    /// it would read as two separate problems.
+    fn blocked_reason(&self) -> Option<SharedString> {
+        if self.running() {
+            return Some("An emd run is in flight.".into());
+        }
+        lock::lock_message(&self.lock).map(SharedString::from)
     }
 
     /// [`EmeraldPanel::mutations_blocked`], but with the REASON attached --
@@ -1693,7 +1808,10 @@ impl EmeraldPanel {
             return;
         };
         let dir_abs = project_root.join(dir_rel);
-        let Some(asset_root) = emerald_asset_root(&dir_abs) else {
+        // The project's `assets`, whether or not it exists yet:
+        // `create_blank_tileset` creates the directories it writes into,
+        // and this entry is offered on projects that have no asset tree.
+        let Some(asset_root) = emerald_asset_dir(&dir_abs) else {
             return;
         };
         let under = dir_abs
@@ -1837,11 +1955,20 @@ impl EmeraldPanel {
     fn toggle_field_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.field_form = match self.field_form {
             Some(_) => None,
-            None => Some(FieldRow {
-                name: single_line(window, cx),
-                kind: FieldDraft::default().kind,
-                ext: single_line(window, cx),
-            }),
+            None => {
+                let name = single_line(window, cx);
+                // Deferred: this runs from the opener's own click
+                // handler, and the panel root's `track_focus` claims the
+                // focus later in the same dispatch -- focusing inline
+                // would be undone by the very click that opened the row.
+                let handle = name.focus_handle(cx);
+                window.defer(cx, move |window, cx| window.focus(&handle, cx));
+                Some(FieldRow {
+                    name,
+                    kind: FieldDraft::default().kind,
+                    ext: single_line(window, cx),
+                })
+            }
         };
         cx.notify();
     }
@@ -1997,6 +2124,45 @@ impl EmeraldPanel {
             window,
             cx,
         );
+    }
+
+    /// Put [`AddSystemModal`] over the window for the selected schedule.
+    ///
+    /// **Deferred, for the same reason [`Self::show_form_modal`] is**:
+    /// this runs inside the panel's own update, and the modal layer reads
+    /// the modal the instant it is shown -- which, through the card's
+    /// picker, reaches back into this entity while it is still leased.
+    ///
+    /// The candidates are resolved HERE rather than inside the card, so
+    /// the card never reads the panel at all: it is handed the run list
+    /// and the refs it may offer, and hands one back.
+    fn open_add_system(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mutations_blocked() {
+            return;
+        }
+        let Some((schedule, _module)) = self.selected_schedule() else {
+            return;
+        };
+        let candidates: Vec<String> =
+            available_systems(&self.manifests.systems, &self.schedule_order)
+                .iter()
+                .map(|system| system_ref(&system.module, &system.name))
+                .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        let Some(workspace) = self.workspace.as_ref().and_then(WeakEntity::upgrade) else {
+            return;
+        };
+        let panel = cx.weak_entity();
+        let order = self.schedule_order.clone();
+        window.defer(cx, move |window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    AddSystemModal::new(panel, schedule, order, candidates, window, cx)
+                });
+            });
+        });
     }
 
     /// Set the entry at `index`'s `@N` cadence.
@@ -2248,6 +2414,13 @@ impl EmeraldPanel {
             return;
         }
         let request = EmdRequest::emd(project_dir, args);
+        // A section hidden over a failure is about to have that failure
+        // replaced by this run's outcome. Leaving it hidden would report
+        // into the dark -- and the state it is hiding is the one the user
+        // most needs to see change.
+        if matches!(self.run_state, RunState::Failed { .. }) {
+            self.run_state_visible = true;
+        }
         self.run_state = RunState::Running {
             command: request.command_line(),
         };
@@ -2700,7 +2873,11 @@ impl EmeraldPanel {
     /// was left in; the revert line answers that in its first clause --
     /// the change was rolled back, nothing is half-applied, and what
     /// follows is the compiler's complaint, not `emd`'s.
-    fn render_run_state(&self) -> Option<gpui::AnyElement> {
+    /// `fill` is true for the dock's draggable section, whose height the
+    /// divider above it owns -- this fills whatever is left of it. It is
+    /// false in the generate modal, which has no divider and caps at
+    /// [`RUN_STATE_DEFAULT_HEIGHT`] instead.
+    fn render_run_state(&self, fill: bool) -> Option<gpui::AnyElement> {
         let details: &[String] = match &self.run_state {
             RunState::Done { details, .. } => details,
             _ => &[],
@@ -2726,15 +2903,20 @@ impl EmeraldPanel {
                 transcript.as_str(),
             ),
         };
+        let scroller = v_flex()
+            .id("ggo-emerald-run-state")
+            .debug_selector(|| "ggo-emerald-run-state".into())
+            .gap_0p5()
+            .p_1()
+            .min_h_0()
+            .overflow_scroll();
+        let scroller = if fill {
+            scroller.flex_1()
+        } else {
+            scroller.max_h(RUN_STATE_DEFAULT_HEIGHT)
+        };
         Some(
-            v_flex()
-                .id("ggo-emerald-run-state")
-                .debug_selector(|| "ggo-emerald-run-state".into())
-                .gap_0p5()
-                .p_1()
-                .max_h(RUN_STATE_MAX_HEIGHT)
-                .min_h_0()
-                .overflow_scroll()
+            scroller
                 .child(
                     ggo_common::CopyableText::new("ggo-emerald-run-message-copy", message)
                         .size(LabelSize::Small)
@@ -2759,6 +2941,101 @@ impl EmeraldPanel {
                 }))
                 .into_any_element(),
         )
+    }
+
+    /// The session-only divider grab handle. `workspace::dock`'s
+    /// resize-handle shape: an occluding strip that starts a
+    /// [`DraggedDivider`] drag, which the body column's `on_drag_move`
+    /// turns into a height. Wrapped in `deferred` by its caller for the
+    /// same reason the dock does it -- the strip straddles a border, and
+    /// the browser above it paints after and would otherwise swallow
+    /// half the grab area.
+    fn divider_handle(cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("ggo-emerald-divider-run")
+            .debug_selector(|| "ggo-emerald-divider-run".into())
+            .on_drag(DraggedDivider(cx.entity_id()), |dragged, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| *dragged)
+            })
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|_, _: &gpui::MouseDownEvent, _, cx| cx.stop_propagation()),
+            )
+            .occlude()
+    }
+
+    /// The run state as the DOCK hosts it: a section whose height the
+    /// divider above it owns, so a long transcript can be read without
+    /// the browser being resized away and vice versa.
+    fn render_run_section(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let body = self.render_run_state(true)?;
+        let visible = self.run_state_visible;
+        Some(
+            v_flex()
+                .relative()
+                .debug_selector(|| "ggo-emerald-run-section".into())
+                .flex_none()
+                // A hidden section is its title row and nothing else, so
+                // the browser above takes the space it was holding.
+                .when(visible, |this| this.h(self.rendered_run_state_height()))
+                .border_t_1()
+                .border_color(cx.theme().colors().border)
+                .child(
+                    h_flex()
+                        .flex_none()
+                        .px_1()
+                        .pt_1()
+                        .gap_1()
+                        .items_center()
+                        .child(Label::new("Run").size(LabelSize::Small).color(Color::Muted))
+                        .child(Self::visibility_toggle(
+                            "ggo-emerald-run-visible",
+                            visible,
+                            |this, cx| {
+                                this.run_state_visible = !this.run_state_visible;
+                                cx.notify();
+                            },
+                            cx,
+                        )),
+                )
+                // With the section collapsed there is no boundary to drag
+                // -- and a handle over a title row would resize something
+                // that is not on screen.
+                .children(visible.then(|| {
+                    gpui::deferred(
+                        Self::divider_handle(cx)
+                            .absolute()
+                            .top(-DIVIDER_SIZE / 2.)
+                            .left_0()
+                            .w_full()
+                            .h(DIVIDER_SIZE)
+                            .cursor_row_resize(),
+                    )
+                }))
+                .children(visible.then_some(body))
+                .into_any_element(),
+        )
+    }
+
+    /// The run section's eye: Eye/EyeOff over a wrapper whose selector
+    /// says which, so a rendered test can read the state off the paint
+    /// (an `IconButton`'s id is not a selector). Same shape as the
+    /// sprite and tileset panels' section eyes.
+    fn visibility_toggle(
+        id: &'static str,
+        visible: bool,
+        toggle: fn(&mut Self, &mut Context<Self>),
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        div()
+            .debug_selector(move || format!("{id}-{}", if visible { "on" } else { "off" }))
+            .child(
+                IconButton::new(id, if visible { IconName::Eye } else { IconName::EyeOff })
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(ui::Tooltip::text("Show/hide the run state"))
+                    .on_click(cx.listener(move |this, _, _, cx| toggle(this, cx))),
+            )
     }
 
     /// The version-lock banner: nothing at all when the installed `emd` is
@@ -2932,9 +3209,21 @@ impl EmeraldPanel {
                 ),
             );
         }
+        let mut open = Button::new("ggo-emerald-field-open", "+ Field")
+            .disabled(blocked)
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_field_form(window, cx)));
+        if let Some(reason) = self.blocked_reason() {
+            open = open.tooltip(ui::Tooltip::text(reason));
+        }
         col.child(
-            Button::new("ggo-emerald-field-open", "+ Field")
-                .on_click(cx.listener(|this, _, window, cx| this.toggle_field_form(window, cx))),
+            div()
+                .debug_selector(move || {
+                    format!(
+                        "ggo-emerald-field-open-{}",
+                        if blocked { "off" } else { "on" }
+                    )
+                })
+                .child(open),
         )
         .into_any_element()
     }
@@ -3080,7 +3369,7 @@ impl EmeraldPanel {
                     .color(Color::Warning),
             );
         }
-        col.child(self.render_add_system_dropdown(window, cx))
+        col.child(self.render_add_system_button(cx))
             .into_any_element()
     }
 
@@ -3117,43 +3406,33 @@ impl EmeraldPanel {
         .into_any_element()
     }
 
-    /// The "+ System" picker: every system NOT already in this run list
-    /// ([`available_systems`]), so adding a duplicate is unreachable
-    /// rather than merely rejected. Picking one commits immediately --
-    /// there is no second "Add" step to forget.
-    fn render_add_system_dropdown(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let available = available_systems(&self.manifests.systems, &self.schedule_order);
-        if available.is_empty() {
+    /// The "+ System" opener: every system NOT already in this run list
+    /// ([`available_systems`]) is offered by [`AddSystemModal`], so
+    /// adding a duplicate is unreachable rather than merely rejected.
+    ///
+    /// **A card, not the dropdown it replaced.** A menu of bare refs said
+    /// nothing about WHERE the pick would land, and a schedule's whole
+    /// meaning is its order; the card shows the resulting run list before
+    /// anything is committed, and gives a project with thirty systems a
+    /// query instead of thirty menu rows.
+    fn render_add_system_button(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if available_systems(&self.manifests.systems, &self.schedule_order).is_empty() {
             return Label::new("every system is already in this schedule")
                 .size(LabelSize::XSmall)
                 .color(Color::Muted)
                 .into_any_element();
         }
-        let weak = cx.weak_entity();
-        let menu = ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
-            for system in &available {
-                let weak = weak.clone();
-                let sref = system_ref(&system.module, &system.name);
-                let label = sref.clone();
-                menu = menu.entry(SharedString::from(label), None, move |window, cx| {
-                    let sref = sref.clone();
-                    weak.update(cx, |this, cx| this.add_system(&sref, window, cx))
-                        .ok();
-                });
-            }
-            menu
-        });
-        DropdownMenu::new(
-            "ggo-emerald-add-system",
-            SharedString::from("+ System"),
-            menu,
-        )
-        .disabled(self.mutations_blocked())
-        .into_any_element()
+        let blocked = self.mutations_blocked();
+        let mut button = Button::new("ggo-emerald-add-system", "+ System")
+            .disabled(blocked)
+            .on_click(cx.listener(|this, _, window, cx| this.open_add_system(window, cx)));
+        if let Some(reason) = self.blocked_reason() {
+            button = button.tooltip(ui::Tooltip::text(reason));
+        }
+        div()
+            .debug_selector(|| "ggo-emerald-add-system".into())
+            .child(button)
+            .into_any_element()
     }
 
     /// The active tab's manifest, grouped by module (shared first, then
@@ -3224,7 +3503,11 @@ impl EmeraldPanel {
         // the dock stays out of it -- two copies of the same transcript
         // in two places is worse than one, and the copy behind the modal
         // is the one nobody can read.
-        let run_state = self.form.is_none().then(|| self.render_run_state()).flatten();
+        let run_state = self
+            .form
+            .is_none()
+            .then(|| self.render_run_section(cx))
+            .flatten();
         // The banner is deliberately NOT part of this emptiness test: an
         // unmanaged project still needs the "right-click a directory" text,
         // and a lock banner is never a substitute for it -- they answer
@@ -3236,11 +3519,51 @@ impl EmeraldPanel {
                 .child(self.render_message(EMPTY_MESSAGE.to_string(), cx))
                 .into_any_element();
         }
+        let bounds_cell = self.body_bounds.clone();
+        // A resize has to REDRAW, not just record: the run state's height
+        // is re-clamped against these bounds during render, so a frame
+        // that merely stores the new ones leaves a dragged section
+        // overhanging the browser's floor until something else happens to
+        // notify. Guarded on a real change, so this settles in one extra
+        // frame.
+        let resized = cx.weak_entity();
         v_flex()
             .id("ggo-emerald-body")
             .debug_selector(|| "ggo-emerald-body".into())
+            .relative()
             .size_full()
             .overflow_y_scroll()
+            // The drag listener lives on the whole column, not on the
+            // handle: a fast drag outruns the 6px strip. `on_drag_move`
+            // fires in the CAPTURE phase for the whole window with no
+            // hitbox test, so this column sees divider drags from OTHER
+            // emerald docks in other windows too -- hence the owner
+            // filter.
+            .on_drag_move(cx.listener(
+                |this, event: &gpui::DragMoveEvent<DraggedDivider>, _, cx| {
+                    let &DraggedDivider(owner) = event.drag(cx);
+                    if owner != cx.entity_id() {
+                        return;
+                    }
+                    this.drag_divider(event.event.position, cx);
+                },
+            ))
+            .child(
+                gpui::canvas(
+                    move |bounds, _window, cx| {
+                        if bounds_cell.replace(Some(bounds)) != Some(bounds) {
+                            cx.defer(move |cx| {
+                                resized.update(cx, |_, cx| cx.notify()).ok();
+                            });
+                        }
+                    },
+                    |_, (), _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            )
             .children(banner)
             .children(browser)
             .children(run_state)
@@ -3872,7 +4195,9 @@ mod tests {
             open_modal(&workspace, cx).is_some(),
             "and the modal it is typed into"
         );
-        let card = cx.debug_bounds("ggo-emerald-modal").expect("the modal card");
+        let card = cx
+            .debug_bounds("ggo-emerald-modal")
+            .expect("the modal card");
         let message = cx
             .debug_bounds("ggo-emerald-run-state")
             .expect("emd's message");
@@ -4849,6 +5174,10 @@ mod tests {
         cx.update(|cx| {
             AppState::test(cx);
             project_panel::init(cx);
+            // The add-system card's picker builds its query field through
+            // `ui_input::ERASED_EDITOR_FACTORY`, which only `editor::init`
+            // installs -- without it the picker panics on construction.
+            editor::init(cx);
             ggo_world_panel::init(cx);
             init(cx);
         });
@@ -5094,10 +5423,11 @@ mod tests {
         };
         assert_eq!(
             contributed("", true, cx),
-            4,
-            "the project root: New Component/System/Schedule + New Module"
+            6,
+            "the project root: New Component/System/Schedule + New Module, \
+             plus the two asset entries"
         );
-        assert_eq!(contributed("manifests", true, cx), 4, "and manifests/");
+        assert_eq!(contributed("manifests", true, cx), 6, "and manifests/");
         assert_eq!(
             contributed("crates/game-core/src/modules/gameplay", true, cx),
             3,
@@ -5116,24 +5446,127 @@ mod tests {
         assert_eq!(contributed("assets/tiles", true, cx), 2, "and below it");
         assert_eq!(
             contributed("crates", true, cx),
-            4,
+            6,
             "any directory in the project outside assets/ and modules"
         );
         assert_eq!(
             contributed("crates/game-core/src", true, cx),
-            4,
+            6,
             "the core crate too"
         );
         assert_eq!(
             contributed("crates/game-core/src/modules", true, cx),
-            4,
-            "the modules directory itself names no module, so the unscoped four"
+            6,
+            "the modules directory itself names no module, so the unscoped six"
         );
         assert_eq!(
             contributed("emerald.toml", false, cx),
             0,
             "this panel claims no files"
         );
+    }
+
+    /// **The asset entries are not gated to `assets/` any more.** They
+    /// were offered only inside the asset tree, which is exactly the
+    /// directory a project that has never made one does not have -- so a
+    /// fresh checkout offered no way to author its first world or
+    /// tileset at all. They now sit with the generate entries, wherever
+    /// those are, and the commit still lands the file under `assets/`.
+    #[gpui::test]
+    async fn test_the_asset_entries_are_offered_before_assets_exists(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("emerald.toml"), "").unwrap();
+        std::fs::create_dir_all(dir.path().join("manifests")).unwrap();
+        assert!(
+            !dir.path().join("assets").exists(),
+            "the fixture deliberately has no asset tree"
+        );
+        let (workspace, _panel, worktree_id, cx) = emerald_workspace(cx, dir.path()).await;
+
+        let count = workspace.update_in(cx, |workspace, window, cx| {
+            workspace
+                .context_menu_contributions(&project_path(worktree_id, ""), true, window, cx)
+                .len()
+        });
+        assert_eq!(
+            count, 6,
+            "the four generate entries plus New World…/New Tileset…"
+        );
+    }
+
+    /// A "New World…" raised OUTSIDE `assets/` -- on the project root,
+    /// where a user who has never opened the asset tree actually clicks
+    /// -- still seeds the editor in `assets/` and runs the `emd generate
+    /// world` whose output lands there (no `--dir`: the asset root IS the
+    /// destination, and `emd` creates it).
+    #[gpui::test]
+    async fn test_new_world_from_the_project_root_lands_in_assets(cx: &mut TestAppContext) {
+        let dir = emerald_project();
+        let (workspace, panel, worktree_id, cx) = emerald_workspace(cx, dir.path()).await;
+        let written = dir.path().join("assets/main.wrld.toml");
+        let reported = written.to_string_lossy().to_string();
+        let (runner, calls) = fake_runner(move |_| {
+            // The stub stands in for `emd generate world`, which is what
+            // actually writes the file the argv below aims at.
+            std::fs::write(&written, "version = 1\n").unwrap();
+            ok_outcome(&reported)
+        });
+        panel.update(cx, |panel, _| panel.runner = runner);
+
+        let seed = asset_seed(dir.path(), dir.path(), "").expect("the root has an asset seed");
+        assert_eq!(
+            seed.seed_rel, "assets",
+            "a click outside the asset tree still seeds the editor inside it"
+        );
+        assert_eq!(seed.base_sub, "", "so the run carries no --dir");
+        let handler = new_world_inline_handler(workspace.downgrade(), worktree_id, seed);
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+        commit_inline(&docked_project_panel(&workspace, cx), "main", cx);
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1, "exactly one emd run");
+        assert_eq!(
+            recorded[0].args,
+            vec!["generate", "world", "main", "--json"]
+        );
+        assert_eq!(recorded[0].cwd, dir.path());
+        assert!(
+            dir.path().join("assets/main.wrld.toml").is_file(),
+            "and the world is in the asset tree, not beside emerald.toml"
+        );
+    }
+
+    /// The same for "New Tileset…", which writes the pair itself rather
+    /// than shelling out -- so it is the one that has to CREATE `assets/`
+    /// when the project has none yet.
+    #[gpui::test]
+    async fn test_new_tileset_outside_assets_creates_the_asset_dir(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("emerald.toml"), "").unwrap();
+        std::fs::create_dir_all(dir.path().join("crates")).unwrap();
+        let (workspace, panel, worktree_id, cx) = emerald_workspace(cx, dir.path()).await;
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
+        panel.update(cx, |panel, _| panel.runner = runner);
+        assert!(!dir.path().join("assets").exists());
+
+        let seed = asset_seed(&dir.path().join("crates"), dir.path(), "crates")
+            .expect("a project directory has an asset seed");
+        let handler = new_tileset_inline_handler(workspace.downgrade(), worktree_id, seed);
+        cx.update(|window, cx| handler(window, cx));
+        cx.run_until_parked();
+        commit_inline(&docked_project_panel(&workspace, cx), "world", cx);
+
+        assert!(calls.lock().unwrap().is_empty(), "emd is not involved");
+        assert_eq!(
+            run_state_message(&panel, cx),
+            "done Created tileset world.til"
+        );
+        assert!(
+            dir.path().join("assets/world.til").is_file(),
+            "the commit creates assets/ and writes the pair into it"
+        );
+        assert!(dir.path().join("assets/world.pal").is_file());
     }
 
     /// [`pathed_project`] behind a real workspace with a real
@@ -5369,10 +5802,7 @@ mod tests {
             detail.contains("1 component: HeroUnit"),
             "the module's own entries are named: {detail}"
         );
-        assert!(
-            detail.contains("1 system: spawn_enemies"),
-            "{detail}"
-        );
+        assert!(detail.contains("1 system: spawn_enemies"), "{detail}");
         assert!(detail.contains("1 schedule: boot"), "{detail}");
 
         cx.simulate_prompt_answer("Delete");
@@ -5415,10 +5845,13 @@ mod tests {
 
         let details = panel.read_with(cx, |panel, _| match &panel.run_state {
             RunState::Done { details, .. } => details.clone(),
-            other => panic!("expected Done, got {}", match other {
-                RunState::Failed { message, .. } => message.clone(),
-                _ => "another state".to_string(),
-            }),
+            other => panic!(
+                "expected Done, got {}",
+                match other {
+                    RunState::Failed { message, .. } => message.clone(),
+                    _ => "another state".to_string(),
+                }
+            ),
         });
         assert_eq!(
             details,
@@ -5870,19 +6303,19 @@ mod tests {
     /// redirected to the project's `assets`; and `None` entirely outside
     /// an emerald project or worktree.
     #[test]
-    fn world_seed_resolves_the_click_to_a_target() {
+    fn asset_seed_resolves_the_click_to_a_target() {
         let dir = emerald_project();
         let root = dir.path();
         std::fs::create_dir_all(root.join("assets/dungeon/floors")).unwrap();
 
-        let seed = world_seed(&root.join("assets"), root, "assets").unwrap();
+        let seed = asset_seed(&root.join("assets"), root, "assets").unwrap();
         assert_eq!(seed.seed_rel, "assets");
         assert_eq!(seed.base_sub, "");
         assert_eq!(seed.fallback_rel, "assets");
         assert_eq!(seed.assets_abs, root.join("assets"));
         assert_eq!(seed.project_dir, root);
 
-        let seed = world_seed(
+        let seed = asset_seed(
             &root.join("assets/dungeon/floors"),
             root,
             "assets/dungeon/floors",
@@ -5893,11 +6326,11 @@ mod tests {
 
         let outside = tempfile::tempdir().unwrap();
         assert!(
-            world_seed(&outside.path().join("assets"), outside.path(), "assets").is_none(),
+            asset_seed(&outside.path().join("assets"), outside.path(), "assets").is_none(),
             "no emerald.toml, no seed"
         );
         assert!(
-            world_seed(&root.join("assets"), outside.path(), "assets").is_none(),
+            asset_seed(&root.join("assets"), outside.path(), "assets").is_none(),
             "a dir outside the worktree cannot be seeded"
         );
     }
@@ -5941,7 +6374,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("assets")).unwrap();
         let (workspace, panel, worktree_id, cx) = emerald_workspace(cx, dir.path()).await;
 
-        let seed = world_seed(&dir.path().join("assets"), dir.path(), "assets")
+        let seed = asset_seed(&dir.path().join("assets"), dir.path(), "assets")
             .expect("an emerald project has a world seed");
         let handler = new_world_inline_handler(workspace.downgrade(), worktree_id, seed);
         cx.update(|window, cx| handler(window, cx));
@@ -5985,7 +6418,7 @@ mod tests {
         });
         cx.run_until_parked();
 
-        let seed = world_seed(&dir.path().join("assets"), dir.path(), "assets").unwrap();
+        let seed = asset_seed(&dir.path().join("assets"), dir.path(), "assets").unwrap();
         let handler = new_world_inline_handler(workspace.downgrade(), worktree_id, seed);
         cx.update(|window, cx| handler(window, cx));
         cx.run_until_parked();
@@ -6039,7 +6472,7 @@ mod tests {
             .await;
         cx.run_until_parked();
 
-        let seed = world_seed(
+        let seed = asset_seed(
             &dir.path().join("assets/dungeon"),
             dir.path(),
             "assets/dungeon",
@@ -6082,7 +6515,7 @@ mod tests {
         let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
         panel.update(cx, |panel, _| panel.runner = runner);
 
-        let seed = world_seed(&dir.path().join("assets"), dir.path(), "assets").unwrap();
+        let seed = asset_seed(&dir.path().join("assets"), dir.path(), "assets").unwrap();
         let handler = new_world_inline_handler(workspace.downgrade(), worktree_id, seed);
         cx.update(|window, cx| handler(window, cx));
         cx.run_until_parked();
@@ -6116,13 +6549,9 @@ mod tests {
         let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
         panel.update(cx, |panel, _| panel.runner = runner);
 
-        let handler = new_tileset_inline_handler(
-            workspace.downgrade(),
-            worktree_id,
-            "assets/tiles".to_string(),
-            dir.path().join("assets/tiles"),
-            "tiles".to_string(),
-        );
+        let seed = asset_seed(&dir.path().join("assets/tiles"), dir.path(), "assets/tiles")
+            .expect("a directory in the asset tree has a seed");
+        let handler = new_tileset_inline_handler(workspace.downgrade(), worktree_id, seed);
         cx.update(|window, cx| handler(window, cx));
         cx.run_until_parked();
         let project_panel = docked_project_panel(&workspace, cx);
@@ -7099,7 +7528,9 @@ mod tests {
             "the modal opens with the name editor focused, ready to type into"
         );
 
-        let card = cx.debug_bounds("ggo-emerald-modal").expect("the modal card");
+        let card = cx
+            .debug_bounds("ggo-emerald-modal")
+            .expect("the modal card");
         let buttons = cx
             .debug_bounds("ggo-emerald-form-buttons")
             .expect("the form's Create/Cancel row");
@@ -7169,7 +7600,9 @@ mod tests {
         });
         cx.run_until_parked();
 
-        let card = cx.debug_bounds("ggo-emerald-modal").expect("the modal card");
+        let card = cx
+            .debug_bounds("ggo-emerald-modal")
+            .expect("the modal card");
         assert!(
             card.origin.y >= px(0.) && card.bottom_right().y <= px(400.),
             "twenty field rows must not push the card off a 400px window: {card:?}"
@@ -7496,6 +7929,199 @@ mod tests {
         assert!(calls.lock().unwrap().is_empty());
     }
 
+    /// **The opener is gated too, not just the Add inside it.** The "+
+    /// Field" row's own commit button has always been
+    /// `disabled(mutations_blocked())`; the button that OPENS the row was
+    /// not, so a blocked panel let the row be opened and then refused the
+    /// only thing in it. A control that opens a dead end is the silent
+    /// no-op this panel's disable rule exists to remove.
+    #[gpui::test]
+    async fn test_the_field_opener_is_disabled_while_mutations_are_blocked(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = populated_project();
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
+        let (panel, cx) = ready_panel_in_window(cx, dir.path(), runner);
+        panel.update(cx, |panel, cx| panel.select_item("HeroUnit", cx));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("ggo-emerald-field-open-on").is_some(),
+            "a ready panel offers the opener"
+        );
+
+        // The state a session that has never run `emd version` is in --
+        // the one the banner is already explaining above this row.
+        panel.update(cx, |panel, cx| {
+            panel.lock = LockCheck::Unchecked;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("ggo-emerald-field-open-off").is_some()
+                && cx.debug_bounds("ggo-emerald-field-open-on").is_none(),
+            "an unchecked lock must show the opener as disabled"
+        );
+
+        click(cx, "ggo-emerald-field-open-off");
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.field_form.is_none(),
+                "and clicking it must not open a row whose Add cannot run"
+            );
+        });
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// The "+ Field" row opens READY TO TYPE INTO. It builds two fresh
+    /// editors and used to leave the focus wherever it was, so the first
+    /// keystroke after the click went nowhere -- the same trap the
+    /// generate modal's name editor and the world panel's inline rename
+    /// both solve with a deferred focus.
+    #[gpui::test]
+    async fn test_opening_the_field_row_focuses_its_name(cx: &mut TestAppContext) {
+        let dir = populated_project();
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/never"));
+        let (panel, cx) = ready_panel_in_window(cx, dir.path(), runner);
+        panel.update(cx, |panel, cx| panel.select_item("HeroUnit", cx));
+        cx.run_until_parked();
+
+        click(cx, "ggo-emerald-field-open-on");
+
+        let name = panel
+            .read_with(cx, |panel, _| {
+                panel.field_form.as_ref().map(|row| row.name.clone())
+            })
+            .expect("the click opens the row");
+        assert!(
+            cx.update(|window, cx| name.read(cx).focus_handle(cx).is_focused(window)),
+            "the row must open with its name editor focused"
+        );
+
+        cx.simulate_input("armour");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| name.read(cx).text(cx)),
+            "armour",
+            "so the first keystroke after the click lands in the name"
+        );
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    // ------------------------------------------ the add-system card
+
+    /// [`populated_project`] with a third system, so the add-system card
+    /// has more than one candidate to filter between.
+    fn three_system_project() -> tempfile::TempDir {
+        let dir = populated_project();
+        std::fs::write(
+            dir.path().join("manifests/systems.toml"),
+            "version = 1\n\
+             [[system]]\nname = \"spawn_enemies\"\nmodule = \"gameplay\"\n\
+             [[system]]\nname = \"tick_clock\"\n\
+             [[system]]\nname = \"draw_sprites\"\nmodule = \"gameplay\"\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn add_system_card(
+        workspace: &Entity<Workspace>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Entity<AddSystemModal> {
+        workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_modal::<AddSystemModal>(cx)
+            })
+            .expect("+ System raises the add-system card")
+    }
+
+    /// **"+ System" is a card now, not a dropdown.** A menu of bare refs
+    /// said nothing about where the pick would LAND, and a schedule's
+    /// whole meaning is its order. The card opens focused on a fuzzy
+    /// query, shows the order the pick would produce, and commits the
+    /// same `emd schedule set` the dropdown's entry did.
+    #[gpui::test]
+    async fn test_add_system_card_filters_previews_and_commits_the_same_argv(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = three_system_project();
+        let (runner, calls) = fake_runner(|_| ok_outcome("/x/render"));
+        let (workspace, panel, cx) = modal_workspace(cx, dir.path(), runner).await;
+        // The dock, so the "+ System" click below travels the real event
+        // path rather than being called on an unrendered panel.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<EmeraldPanel>(window, cx);
+        });
+        panel.update(cx, |panel, cx| {
+            panel.refresh_root(cx);
+            panel.select_tab(BrowseTab::Schedules, cx);
+            panel.select_item("render", cx);
+        });
+        cx.run_until_parked();
+        // The dock is laid out on the next resize, not on the toggle: a
+        // MultiWorkspace test window draws its docks at zero width until
+        // one arrives, and `debug_bounds` reads the last painted frame.
+        resize(cx, 1200., 800.);
+        let before = order(&panel, cx);
+        assert_eq!(before, ["gameplay/spawn_enemies@4"]);
+
+        click(cx, "ggo-emerald-add-system");
+        let card = add_system_card(&workspace, cx);
+        assert!(
+            cx.update(|window, cx| card.read(cx).focus_handle(cx).is_focused(window)),
+            "the card opens with its query focused"
+        );
+
+        let picker = card.read_with(cx, |card, _| card.picker().clone());
+        assert_eq!(
+            picker.read_with(cx, |picker, _| picker.delegate.match_refs()),
+            ["tick_clock", "gameplay/draw_sprites"],
+            "only the systems this schedule does NOT already run are offered"
+        );
+        assert_eq!(
+            card.read_with(cx, |card, _| card.preview()),
+            ["gameplay/spawn_enemies@4", "tick_clock"],
+            "the preview is the run order the highlighted row would produce"
+        );
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker.set_query("draw", window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            picker.read_with(cx, |picker, _| picker.delegate.match_refs()),
+            ["gameplay/draw_sprites"],
+            "the query filters the list"
+        );
+        assert_eq!(
+            card.read_with(cx, |card, _| card.preview()),
+            ["gameplay/spawn_enemies@4", "gameplay/draw_sprites"],
+            "and the preview follows the highlight the filter moved"
+        );
+
+        click(cx, "ggo-emerald-add-system-confirm");
+
+        let added = apply_order_edit(
+            &before,
+            OrderEdit::Add {
+                system_ref: "gameplay/draw_sprites".to_string(),
+            },
+        );
+        assert_eq!(calls.lock().unwrap().len(), 1, "exactly one spawn");
+        assert_eq!(
+            calls.lock().unwrap()[0].args,
+            expected_set_argv("render", "", &added),
+            "the card commits the dropdown's own argv"
+        );
+        assert!(
+            workspace
+                .read_with(cx, |workspace, cx| workspace
+                    .active_modal::<AddSystemModal>(cx))
+                .is_none(),
+            "confirming dismisses the card"
+        );
+    }
+
     // ------------------------------------------- overflow in a small pane
 
     /// [`rendered_panel`] with the manifests read off disk, as the layout
@@ -7527,6 +8153,163 @@ mod tests {
             touch_phase: gpui::TouchPhase::default(),
         });
         cx.run_until_parked();
+    }
+
+    /// A run to report, so the run-state section is on screen.
+    fn seed_failed_run(panel: &Entity<EmeraldPanel>, cx: &mut gpui::VisualTestContext) {
+        panel.update(cx, |panel, cx| {
+            panel.run_state = RunState::Failed {
+                message: "emd said no".to_string(),
+                transcript: String::new(),
+            };
+            cx.notify();
+        });
+    }
+
+    /// The browser/run-state boundary is draggable, session-only, and
+    /// re-clamped against a pane that got shorter afterwards -- the
+    /// sprite panel's `Divider::Clips` shape. Before this the split was
+    /// two constants, so a long transcript could only ever be read 240px
+    /// at a time.
+    #[gpui::test]
+    async fn test_the_run_state_divider_resizes_and_reclamps(cx: &mut TestAppContext) {
+        let dir = populated_project();
+        let (runner, _calls) = fake_runner(|_| ok_outcome("/x/never"));
+        let (panel, cx) = ready_panel_in_window(cx, dir.path(), runner);
+        seed_failed_run(&panel, cx);
+        resize(cx, 400., 700.);
+
+        let before = cx
+            .debug_bounds("ggo-emerald-run-section")
+            .expect("the run-state section is painted");
+        assert_eq!(
+            before.size.height, RUN_STATE_DEFAULT_HEIGHT,
+            "undragged, the section sits at its default height"
+        );
+        let handle = cx
+            .debug_bounds("ggo-emerald-divider-run")
+            .expect("the divider handle is painted");
+        assert!(
+            (handle.center().y - before.origin.y).abs() <= DIVIDER_SIZE,
+            "the handle must straddle the section's top edge: {handle:?} over {before:?}"
+        );
+
+        // The whole rendered gesture: the handle starts the drag and the
+        // BODY column's `on_drag_move` turns it into a height.
+        let target = gpui::point(before.center().x, before.origin.y - px(100.));
+        cx.simulate_mouse_move(handle.center(), None, gpui::Modifiers::default());
+        cx.simulate_mouse_down(
+            handle.center(),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_move(target, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(target, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_up(target, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        let after = cx
+            .debug_bounds("ggo-emerald-run-section")
+            .expect("the section after the drag");
+        assert!(
+            (after.size.height - before.size.height - px(100.)).abs() < px(2.),
+            "dragging 100px up must make the run state 100px taller: before {:?}, after {:?}",
+            before.size,
+            after.size
+        );
+
+        // Shortened afterwards: the dragged height is a render-time clamp
+        // away from swallowing the browser's floor. The clamp reads the
+        // bounds the canvas recorded at the previous prepaint, so it
+        // bites on the next draw rather than within the resize's frame.
+        resize(cx, 400., 300.);
+        panel.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        let short = cx
+            .debug_bounds("ggo-emerald-run-section")
+            .expect("the section after the resize");
+        assert!(
+            short.size.height <= px(300.) - BROWSER_MIN_HEIGHT,
+            "a short pane must re-clamp the dragged height: {short:?}"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.run_state_height,
+                Some(after.size.height),
+                "the clamp is a render concern -- the dragged height survives it"
+            );
+        });
+    }
+
+    /// **The run state has an eye, and it cannot hide a failure for
+    /// good.** Collapsing the section to its title is a view choice --
+    /// a transcript nobody is reading is 240px the browser could use --
+    /// but the next run reports into that section, so a section left
+    /// hidden over a FAILED run would swallow the answer to "did that
+    /// work?". Starting a run re-opens it.
+    #[gpui::test]
+    async fn test_the_run_state_eye_collapses_it_and_a_run_brings_it_back(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = populated_project();
+        let (runner, _calls) = fake_runner(|_| ok_outcome("/x/never"));
+        let (panel, cx) = ready_panel_in_window(cx, dir.path(), runner);
+        seed_failed_run(&panel, cx);
+        resize(cx, 400., 700.);
+
+        let open = cx
+            .debug_bounds("ggo-emerald-run-section")
+            .expect("the run-state section");
+        assert!(
+            cx.debug_bounds("ggo-emerald-run-state").is_some(),
+            "the transcript scroller is on screen"
+        );
+
+        click(cx, "ggo-emerald-run-visible-on");
+        assert!(
+            cx.debug_bounds("ggo-emerald-run-state").is_none(),
+            "hiding collapses the section to its title row"
+        );
+        assert!(
+            cx.debug_bounds("ggo-emerald-divider-run").is_none(),
+            "with no boundary left to drag"
+        );
+        let closed = cx
+            .debug_bounds("ggo-emerald-run-section")
+            .expect("the title row stays, so the eye can reopen it");
+        assert!(
+            closed.size.height < open.size.height,
+            "collapsed {closed:?} must be shorter than open {open:?}"
+        );
+
+        click(cx, "ggo-emerald-run-visible-off");
+        assert!(
+            cx.debug_bounds("ggo-emerald-run-state").is_some(),
+            "the eye toggles back"
+        );
+
+        // Hidden again, over a FAILED run -- and then a new run starts.
+        click(cx, "ggo-emerald-run-visible-on");
+        panel.read_with(cx, |panel, _| {
+            assert!(matches!(panel.run_state, RunState::Failed { .. }));
+            assert!(!panel.run_state_visible);
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.select_tab(BrowseTab::Schedules, cx);
+            panel.select_item("update", cx);
+            panel.move_system(1, true, window, cx);
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.run_state_visible,
+                "a run started over a hidden failure must re-show the section"
+            );
+        });
+        assert!(
+            cx.debug_bounds("ggo-emerald-run-state").is_some(),
+            "so its outcome is readable"
+        );
     }
 
     /// Overflow class B: the three tab buttons are wider than a narrow

@@ -106,7 +106,7 @@ impl Render for GenerateModal {
         // open: a failed `emd` keeps the form, and its message has to be
         // readable next to the name that caused it rather than behind
         // the modal in a dock the user may never have opened.
-        let run_state = self.panel.read(cx).render_run_state();
+        let run_state = self.panel.read(cx).render_run_state(false);
 
         div()
             .debug_selector(|| "ggo-emerald-modal".into())
