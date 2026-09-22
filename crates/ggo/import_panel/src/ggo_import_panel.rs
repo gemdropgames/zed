@@ -47,6 +47,13 @@
 //! a crop that will be zero-padded on its right/bottom edge is visible before
 //! the commit rather than after.
 //!
+//! The **destination** -- directory, name, the two quantization toggles
+//! and the sprite cut -- is asked for in a centred card
+//! ([`DestinationModal`]) raised by the footer's "Import…" button, not in
+//! a strip nailed under the viewer: see that module's own doc for why it
+//! moved. The band between the crop canvas and the palette is sized by a
+//! divider handle on its top border ([`preview_divider_height`]).
+//!
 //! There is deliberately **no cell-size control**. ggo-ide had Cell W/H
 //! inputs and a live grid at that size, but they lived inside
 //! `<Show when={mode() === 'metasprite'}>` -- they sized METASPRITE FRAMES
@@ -78,12 +85,14 @@
 //!   replacement anywhere in the fork; the palette is whatever quantization
 //!   derives. The spec calls this out as an honest, permanent loss.
 
+mod destination_modal;
 mod geom;
 mod import_item;
 mod loader;
 mod preserve;
 mod thumbnails;
 
+pub use destination_modal::DestinationModal;
 pub use import_item::{ImportItem, open_import_item};
 
 use std::cell::RefCell;
@@ -93,10 +102,11 @@ use std::sync::Arc;
 
 use editor::Editor;
 use gpui::{
-    App, BorderStyle, Bounds, ContentMask, Context, Corners, Entity, FocusHandle, Focusable, Hsla,
-    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
-    PathPromptOptions, Pixels, Render, RenderImage, ScrollWheelEvent, Styled, Task, WeakEntity,
-    Window, actions, bounds, div, fill, img, outline, point, px, rgb, rgba, size,
+    App, BorderStyle, Bounds, ContentMask, Context, Corners, Entity, EntityId, EventEmitter,
+    FocusHandle, Focusable, Hsla, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Render, RenderImage, ScrollWheelEvent,
+    Styled, Task, WeakEntity, Window, actions, bounds, div, fill, img, outline, point, px, rgb,
+    rgba, size,
 };
 use project::ProjectPath;
 use ui::prelude::*;
@@ -153,11 +163,19 @@ const SPRITES_DIR: &str = "sprites";
 /// project panel, or via the picker button for a PNG outside the project.
 const EMPTY_MESSAGE: &str = "Right-click a .png in the project panel → Import as tileset…";
 
-/// The quantized preview strip's height.
+/// The quantized preview strip's height before any drag -- the default
+/// of the session-only [`ImportPanel::preview_height`].
 const PREVIEW_HEIGHT: Pixels = px(120.);
+/// The smallest a [`DraggedPreviewDivider`] drag may leave the band: a
+/// tile and a half, so what is in there still reads as pixels.
+const MIN_PREVIEW_HEIGHT: Pixels = px(48.);
 /// Floor for the crop canvas so that chrome taller than the pane scrolls
 /// the root instead of flattening the canvas to nothing.
 const CANVAS_MIN_HEIGHT: Pixels = px(120.);
+/// The divider handle's grab height, straddling the border it sizes --
+/// the same figure `workspace::dock`'s `RESIZE_HANDLE_SIZE` uses, and
+/// the one `ggo_sprite_panel`'s dividers are drawn at.
+const DIVIDER_SIZE: Pixels = px(6.);
 
 /// The transparency checkerboard behind the source and the preview -- same
 /// square size and greys as the tileset panel's sheet backdrop, so
@@ -615,6 +633,45 @@ struct PanDrag {
     start_pan: [f32; 2],
 }
 
+/// The band divider mid-drag. `workspace::DraggedDock`'s shape, as
+/// `ggo_sprite_panel`'s dividers use it: the drag state rides on the drag
+/// itself and the ghost renders nothing, because the visible feedback is
+/// the resized layout, not a floating chip.
+///
+/// The [`EntityId`] is the panel the handle belongs to, and it is load
+/// bearing: `on_drag_move` fires in the CAPTURE phase on every mounted
+/// listener whose drag type matches, with no hitbox test, so with two
+/// import tabs open in split panes a drag in one would otherwise resize
+/// both.
+#[derive(Clone, Copy)]
+struct DraggedPreviewDivider(EntityId);
+
+impl Render for DraggedPreviewDivider {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+/// Resolve a band-divider drag at window position `position` into the
+/// band's new height, clamped so neither the band nor the crop canvas
+/// falls below its floor.
+///
+/// Measured UP from the band's BOTTOM edge: the palette and footer under
+/// the band are fixed-height, so that edge holds still while the drag
+/// moves the band's top -- which therefore cannot be the edge the height
+/// is measured from.
+///
+/// Pure so the clamps are testable without a window.
+fn preview_divider_height(
+    position: gpui::Point<Pixels>,
+    canvas: Bounds<Pixels>,
+    band: Bounds<Pixels>,
+) -> Pixels {
+    let available = canvas.size.height + band.size.height;
+    let max = (available - CANVAS_MIN_HEIGHT).max(MIN_PREVIEW_HEIGHT);
+    (band.bottom() - position.y).clamp(MIN_PREVIEW_HEIGHT, max)
+}
+
 /// The form fields: destination directory + stem, and the sprite cut's
 /// frame size in whole TILES. The frame fields are blank by default --
 /// blank (or unparseable) means "one frame at the crop bounds"
@@ -827,6 +884,12 @@ impl OpenImport {
     }
 }
 
+/// What the panel tells [`DestinationModal`] about, so the card and the
+/// form behind it can never disagree about whether one is open.
+pub enum ImportPanelEvent {
+    FormClosed,
+}
+
 enum ViewerState {
     /// Nothing opened yet.
     Empty,
@@ -858,7 +921,26 @@ pub struct ImportPanel {
     /// -- which is exactly when the user most needs to be told what was
     /// written.
     last_import: Option<Imported>,
+    /// True while the destination card ([`DestinationModal`]) is up. The
+    /// card holds no state of its own, so this is what "a form is open"
+    /// means.
+    form_open: bool,
+    /// The quantized band's height once a divider drag has set one.
+    /// Session-only, like every divider in the fork: it is a reading
+    /// posture, not a property of the import.
+    preview_height: Option<Pixels>,
+    /// The scrolling body's on-screen bounds, recorded at prepaint --
+    /// what [`Self::rendered_preview_height`] re-clamps against.
+    panel_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    /// The preview band's own on-screen bounds, recorded at prepaint --
+    /// the edge [`preview_divider_height`] measures up from.
+    preview_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    /// Whether the palette section shows its slots. Session-only, and
+    /// hidden still leaves the title row (and its eye) on screen.
+    palette_visible: bool,
 }
+
+impl EventEmitter<ImportPanelEvent> for ImportPanel {}
 
 impl ImportPanel {
     pub fn new(workspace: Option<WeakEntity<Workspace>>, cx: &mut Context<Self>) -> Self {
@@ -873,6 +955,11 @@ impl ImportPanel {
             _load_task: None,
             status: None,
             last_import: None,
+            form_open: false,
+            preview_height: None,
+            panel_bounds: Rc::new(RefCell::new(None)),
+            preview_bounds: Rc::new(RefCell::new(None)),
+            palette_visible: true,
         }
     }
 
@@ -1323,6 +1410,64 @@ impl ImportPanel {
         cx.notify();
     }
 
+    // ------------------------------------------------------------ divider
+
+    /// Apply one step of a band-divider drag. Drops out before `notify`
+    /// when the clamped height is the one already in force -- a drag
+    /// emits a move event per mouse position, most of which land in the
+    /// same pixel row once a clamp is biting.
+    fn drag_preview_divider(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(canvas) = self.ready().and_then(|open| *open.canvas_bounds.borrow()) else {
+            return;
+        };
+        let Some(band) = *self.preview_bounds.borrow() else {
+            return;
+        };
+        let height = preview_divider_height(position, canvas, band);
+        if self.preview_height.replace(height) != Some(height) {
+            cx.notify();
+        }
+    }
+
+    /// The band's height AS RENDERED: the dragged height (or
+    /// [`PREVIEW_HEIGHT`]) re-clamped against the body's current height.
+    /// [`Self::drag_preview_divider`] clamps against the canvas at drag
+    /// time, but the pane can be shortened afterwards -- without this the
+    /// band would keep a height the pane can no longer hold and push the
+    /// canvas onto its floor and the root into scrolling. Only ever
+    /// shrinks the stored value; widening the pane restores the drag.
+    fn rendered_preview_height(&self) -> Pixels {
+        let height = self.preview_height.unwrap_or(PREVIEW_HEIGHT);
+        let Some(body) = *self.panel_bounds.borrow() else {
+            return height;
+        };
+        height.min((body.size.height - CANVAS_MIN_HEIGHT).max(MIN_PREVIEW_HEIGHT))
+    }
+
+    /// The band's grab handle. `workspace::dock`'s resize-handle shape:
+    /// an occluding strip that starts a [`DraggedPreviewDivider`] drag,
+    /// which the body's `on_drag_move` turns into a height. The caller
+    /// wraps it in `deferred` for the same reason the dock does -- the
+    /// strip straddles a border, and the canvas on the far side paints
+    /// after it and would otherwise swallow half the grab area.
+    fn preview_divider_handle(cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("ggo-import-divider-preview")
+            .debug_selector(|| "ggo-import-divider-preview".into())
+            .on_drag(
+                DraggedPreviewDivider(cx.entity_id()),
+                |dragged, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| *dragged)
+                },
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+            )
+            .occlude()
+    }
+
     // ------------------------------------------------------------- fields
 
     /// Create the two form fields on the first Ready render, seeded from the
@@ -1347,6 +1492,72 @@ impl ImportPanel {
         if let ViewerState::Ready(open) = &mut self.state {
             open.fields = Some(fields);
         }
+    }
+
+    /// The focus the destination card opens on: the destination
+    /// directory, the first thing the form asks for.
+    fn form_focus_handle(&self, cx: &App) -> Option<FocusHandle> {
+        Some(self.ready()?.fields.as_ref()?.dir.read(cx).focus_handle(cx))
+    }
+
+    /// The "Import…" button: raise the destination card over the window.
+    ///
+    /// Builds the fields FIRST, because the card's [`Focusable`] reads
+    /// the `dir` editor out of them the instant the modal layer opens it.
+    fn open_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.state, ViewerState::Ready(_)) {
+            return;
+        }
+        self.ensure_fields(window, cx);
+        self.form_open = true;
+        cx.notify();
+        self.show_form_modal(window, cx);
+    }
+
+    /// Put [`DestinationModal`] over the window for the form just opened.
+    ///
+    /// **Deferred, and it has to be.** This runs inside the panel's own
+    /// update, and the modal layer READS the modal the instant it is
+    /// shown (for the focus handle to focus), which reads this panel --
+    /// a read of an entity that is still leased, i.e. the panic the
+    /// fork's other deferrals exist to avoid. `window.defer`, not
+    /// `cx.defer_in`: the latter re-takes this entity's update for its
+    /// callback, which is the identical panic one frame later.
+    fn show_form_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.as_ref().and_then(WeakEntity::upgrade) else {
+            return;
+        };
+        let panel = cx.entity();
+        window.defer(cx, move |window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                // `toggle_modal` would CLOSE an open card rather than
+                // reopen it, taking the form that was just set with it
+                // (its dismissal cancels the form).
+                if workspace.active_modal::<DestinationModal>(cx).is_some() {
+                    return;
+                }
+                workspace.toggle_modal(window, cx, |_, cx| DestinationModal::new(panel, cx));
+            });
+        });
+    }
+
+    /// The ONE form exit: cancelling, dismissing the card, and the commit
+    /// that takes the question away. A no-op when nothing is open,
+    /// deliberately -- closing is a loop (the card's `on_before_dismiss`
+    /// cancels the form, cancelling emits `FormClosed`, and `FormClosed`
+    /// dismisses the card again), and this guard is what makes the second
+    /// lap do nothing.
+    ///
+    /// The field editors are NOT reset: they are the destination, not a
+    /// draft of it, and a cancelled card must leave what was typed where
+    /// the next one will show it.
+    fn cancel_form(&mut self, cx: &mut Context<Self>) {
+        if !self.form_open {
+            return;
+        }
+        self.form_open = false;
+        cx.emit(ImportPanelEvent::FormClosed);
+        cx.notify();
     }
 
     fn new_field(value: &str, window: &mut Window, cx: &mut Context<Self>) -> Entity<Editor> {
@@ -1432,9 +1643,14 @@ impl ImportPanel {
         // (the PNG is the source of truth), but never unannounced.
         let bound_sprites = self.sprites_bound_to_dest();
         let confirm = match (&preserve_prompt, collisions.is_empty()) {
-            (Some(message), _) => {
-                ggo_common::confirm_destructive(message, "Replace Artwork", false, window, cx)
-            }
+            (Some(message), _) => ggo_common::confirm_destructive_cascade(
+                message,
+                &bound_sprites,
+                "Replace Artwork",
+                false,
+                window,
+                cx,
+            ),
             (None, false) => ggo_common::confirm_destructive_cascade(
                 &overwrite_message(&collisions),
                 &bound_sprites,
@@ -1445,6 +1661,10 @@ impl ImportPanel {
             ),
             (None, true) => Task::ready(true),
         };
+        // The question has been answered; everything from here is the
+        // answer being carried out, and its outcome is reported in the
+        // tab (the summary and status lines under the viewer).
+        self.cancel_form(cx);
 
         cx.spawn_in(window, async move |this, cx| {
             if !confirm.await {
@@ -1698,24 +1918,47 @@ impl ImportPanel {
     // ---------------------------------------------------------- re-import
 
     /// The `.spr` files bound to the `.til` this commit would overwrite --
-    /// the cascade a plain tileset import carries, since their frames
-    /// address that tileset BY INDEX and this rewrites it.
+    /// the cascade BOTH confirm branches carry, since those sprites'
+    /// frames address that tileset BY INDEX and either kind of import
+    /// rewrites it.
     ///
-    /// Empty for a sprite import: that path writes the whole trio, and
-    /// `preserve::check` refuses a shared tileset outright rather than
-    /// warning about it.
+    /// A sprite import is not exempt. It writes the whole trio, so the
+    /// `.til` under every sprite bound to it is rewritten just the same;
+    /// `preserve::check` refuses to carry ANIMATIONS across a shared
+    /// tileset, but that refusal lands after the confirm, which is
+    /// exactly why the confirm has to name the sprites at stake.
     fn sprites_bound_to_dest(&self) -> Vec<String> {
         let Some(open) = self.ready() else {
             return Vec::new();
         };
-        if open.as_sprite {
-            return Vec::new();
-        }
         let (dest_root, dest_stem) = open.dest();
         preserve::bound_cascade(&preserve::sprites_bound_to(
             &dest_root,
             &format!("{dest_stem}.til"),
         ))
+    }
+
+    /// Every file a commit would write, each paired with whether one is
+    /// already there -- the destination card's preview, so "this replaces
+    /// something" is visible while the name is still being typed rather
+    /// than only in the confirm prompt afterwards.
+    fn dest_targets_with_existing(&self) -> Vec<(String, bool)> {
+        let Some(open) = self.ready() else {
+            return Vec::new();
+        };
+        let (dest_root, dest_stem) = open.dest();
+        let targets = open.dest_targets();
+        let collisions = existing_collisions(
+            &existing_rels(&dest_root, &parent_dir(&dest_stem)),
+            &targets,
+        );
+        targets
+            .into_iter()
+            .map(|target| {
+                let replaces = collisions.contains(&target);
+                (target, replaces)
+            })
+            .collect()
     }
 
     /// The confirm message for replacing an existing sprite's artwork, or
@@ -2040,13 +2283,42 @@ impl ImportPanel {
                 .color(Color::Muted)
                 .into_any_element(),
         };
+        let bounds_slot = self.preview_bounds.clone();
         div()
-            .id("ggo-import-preview")
-            .h(PREVIEW_HEIGHT)
-            .overflow_scroll()
+            .relative()
+            .debug_selector(|| "ggo-import-preview-band".into())
+            .flex_none()
+            .h(self.rendered_preview_height())
             .border_t_1()
             .border_color(cx.theme().colors().border)
-            .child(body)
+            .child(
+                gpui::canvas(
+                    move |bounds, _window, _cx| {
+                        *bounds_slot.borrow_mut() = Some(bounds);
+                    },
+                    |_, (), _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            )
+            .child(
+                div()
+                    .id("ggo-import-preview")
+                    .size_full()
+                    .overflow_scroll()
+                    .child(body),
+            )
+            .child(gpui::deferred(
+                Self::preview_divider_handle(cx)
+                    .absolute()
+                    .top(-DIVIDER_SIZE / 2.)
+                    .left_0()
+                    .w_full()
+                    .h(DIVIDER_SIZE)
+                    .cursor_row_resize(),
+            ))
             .into_any_element()
     }
 
@@ -2063,13 +2335,50 @@ impl ImportPanel {
         let palette = preview.palette;
         let editable = !open.as_sprite;
         let pick = open.swatch_pick.filter(|_| editable);
-        h_flex()
+        let visible = self.palette_visible;
+        let header = h_flex()
+            .debug_selector(|| "ggo-import-palette-header".into())
+            .flex_none()
+            .px_1()
+            .pt_1()
+            .gap_1()
+            .items_center()
+            .child(
+                Label::new("Palette")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                div()
+                    .debug_selector(move || {
+                        format!(
+                            "ggo-import-palette-visible-{}",
+                            if visible { "on" } else { "off" }
+                        )
+                    })
+                    .child(
+                        IconButton::new(
+                            "ggo-import-palette-visible",
+                            if visible {
+                                IconName::Eye
+                            } else {
+                                IconName::EyeOff
+                            },
+                        )
+                        .icon_size(IconSize::XSmall)
+                        .tooltip(Tooltip::text("Show/hide the quantized palette"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.palette_visible = !this.palette_visible;
+                            cx.notify();
+                        })),
+                    ),
+            );
+        let slots = h_flex()
+            .debug_selector(|| "ggo-import-palette-swatches".into())
             .flex_wrap()
             .gap_0p5()
             .p_1()
             .items_center()
-            .border_t_1()
-            .border_color(cx.theme().colors().border)
             .children((0..PAL_SLOTS).map(|slot| {
                 let [r, g, b, a] = slot_rgba(&palette, slot as u8);
                 let color = u32::from_be_bytes([0, r, g, b]);
@@ -2134,27 +2443,39 @@ impl ImportPanel {
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
                 )
-            })
+            });
+
+        v_flex()
+            .debug_selector(|| "ggo-import-palette".into())
+            .flex_none()
+            .border_t_1()
+            .border_color(cx.theme().colors().border)
+            .child(header)
+            .children(visible.then_some(slots))
             .into_any_element()
     }
 
-    /// Destination, the transparent-slot toggle, the slice readout and
-    /// Import.
-    fn render_footer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// The destination form, as rendered INSIDE [`DestinationModal`]:
+    /// where the import lands, how it is cut, and the list of files it
+    /// will write. Everything here drives the panel -- the card owns no
+    /// state of its own -- so the listeners are bound to this entity and
+    /// keep working from inside the card's element tree.
+    fn render_destination_form(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        // The card can render before the tab has: its own open path
+        // builds the fields, but a redraw driven by a panel change must
+        // not be able to find them missing.
+        self.ensure_fields(window, cx);
         let ViewerState::Ready(open) = &self.state else {
-            unreachable!("render_footer is only called in the Ready state");
+            return div().into_any_element();
         };
         let Some(fields) = &open.fields else {
             return div().into_any_element();
         };
         let crop = open.crop();
-        let (cols, rows, tiles) = geom::tiles_for(crop);
-        let whole = geom::whole_tiles(crop);
-        let ragged = geom::is_ragged(crop);
-        let readout = format!("{tiles} tiles ({cols}x{rows}) · {whole} whole");
-        // The RESOLVED targets, so what is shown is what is written -- see
-        // `OpenImport::dest_targets`.
-        let targets = open.dest_targets().join(", ");
         let can_commit = open.wizard.can_commit();
         let reserve = open.wizard.reserve_transparent;
         let as_sprite = open.as_sprite;
@@ -2162,19 +2483,17 @@ impl ImportPanel {
         let source_frames = open.frames.len();
         let weak = cx.weak_entity();
         let weak_sprite = weak.clone();
+        let targets = self.render_target_list(cx);
 
         v_flex()
-            .debug_selector(|| "ggo-import-footer".into())
+            .debug_selector(|| "ggo-import-form".into())
             .gap_1()
-            .p_1()
-            .border_t_1()
-            .border_color(cx.theme().colors().border)
             .child(
                 h_flex()
                     .gap_1()
                     .flex_wrap()
-                    .child(Self::field("Dir", 96., &fields.dir, cx))
-                    .child(Self::field("Name", 96., &fields.stem, cx)),
+                    .child(Self::field("Dir", 140., &fields.dir, cx))
+                    .child(Self::field("Name", 140., &fields.stem, cx)),
             )
             .child(
                 h_flex()
@@ -2231,6 +2550,96 @@ impl ImportPanel {
                         ),
                 )
             })
+            .child(targets)
+            .child(
+                h_flex()
+                    .debug_selector(|| "ggo-import-form-buttons".into())
+                    .gap_1()
+                    .flex_wrap()
+                    .items_center()
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("ggo-import-cancel", "Cancel")
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_form(cx))),
+                    )
+                    .child(
+                        Button::new("ggo-import-commit", "Import")
+                            .disabled(!can_commit)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.import_impl(window, cx)),
+                            ),
+                    ),
+            )
+            // A refused commit (a blanked name) keeps the card up, so its
+            // reason has to be readable HERE -- in the tab's footer it
+            // would be behind the card that caused it.
+            .children(self.status.clone().map(|status| {
+                Label::new(status)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Warning)
+            }))
+            .into_any_element()
+    }
+
+    /// What the commit will write, one row per file, with the ones that
+    /// already exist called out -- the card's preview of the cost.
+    fn render_target_list(&self, cx: &Context<Self>) -> gpui::AnyElement {
+        let targets = self.dest_targets_with_existing();
+        v_flex()
+            .debug_selector(|| "ggo-import-target-list".into())
+            .gap_0p5()
+            .p_1()
+            .border_1()
+            .border_color(cx.theme().colors().border_variant)
+            .rounded_sm()
+            .child(
+                Label::new(if targets.len() == 1 {
+                    "Writes 1 file".to_string()
+                } else {
+                    format!("Writes {} files", targets.len())
+                })
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+            )
+            .children(targets.into_iter().map(|(target, replaces)| {
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(Label::new(target).size(LabelSize::XSmall))
+                    .when(replaces, |el| {
+                        el.child(
+                            Label::new("replaces existing")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Warning),
+                        )
+                    })
+            }))
+            .into_any_element()
+    }
+
+    /// The slice readout, where the import would land, and the button
+    /// that asks for the destination ([`DestinationModal`]). The form
+    /// itself lives in the card, so the viewer above keeps the height the
+    /// six controls used to take.
+    fn render_footer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let ViewerState::Ready(open) = &self.state else {
+            unreachable!("render_footer is only called in the Ready state");
+        };
+        let crop = open.crop();
+        let (cols, rows, tiles) = geom::tiles_for(crop);
+        let whole = geom::whole_tiles(crop);
+        let ragged = geom::is_ragged(crop);
+        let readout = format!("{tiles} tiles ({cols}x{rows}) · {whole} whole");
+        // The RESOLVED targets, so what is shown is what is written -- see
+        // `OpenImport::dest_targets`.
+        let targets = open.dest_targets().join(", ");
+
+        v_flex()
+            .debug_selector(|| "ggo-import-footer".into())
+            .gap_1()
+            .p_1()
+            .border_t_1()
+            .border_color(cx.theme().colors().border)
             .child(
                 Label::new(readout)
                     .size(LabelSize::XSmall)
@@ -2257,11 +2666,11 @@ impl ImportPanel {
                     )
                     .child(div().flex_1())
                     .child(
-                        Button::new("ggo-import-commit", "Import")
-                            .disabled(!can_commit)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.import_impl(window, cx)),
-                            ),
+                        div()
+                            .debug_selector(|| "ggo-import-open-form".into())
+                            .child(Button::new("ggo-import-open-form-button", "Import…").on_click(
+                                cx.listener(|this, _, window, cx| this.open_form(window, cx)),
+                            )),
                     ),
             )
             .children(self.import_summary().map(|summary| {
@@ -2315,6 +2724,21 @@ impl ImportPanel {
             .id("ggo-import-ready")
             .size_full()
             .overflow_y_scroll()
+            // The drag listener lives on the whole column, not on the
+            // handle: a fast drag outruns the 6px strip. `on_drag_move`
+            // fires in the CAPTURE phase for the whole window with no
+            // hitbox test, so this column sees divider drags from OTHER
+            // import tabs in other split panes too -- hence the owner
+            // filter.
+            .on_drag_move(cx.listener(
+                |this, event: &gpui::DragMoveEvent<DraggedPreviewDivider>, _, cx| {
+                    let &DraggedPreviewDivider(owner) = event.drag(cx);
+                    if owner != cx.entity_id() {
+                        return;
+                    }
+                    this.drag_preview_divider(event.event.position, cx);
+                },
+            ))
             .child(header)
             .child(
                 div()
@@ -2453,6 +2877,8 @@ impl Render for ImportPanel {
             ViewerState::Error(e) => self.render_load_error(format!("Failed to load: {e}"), cx),
             ViewerState::Ready(_) => self.render_ready(cx),
         };
+        let panel_bounds = self.panel_bounds.clone();
+        let weak = cx.weak_entity();
         v_flex()
             .key_context(KEY_CONTEXT)
             .size_full()
@@ -2466,7 +2892,40 @@ impl Render for ImportPanel {
             .on_action(cx.listener(|this, _: &ZoomOut, _window, cx| this.step_zoom(-1, cx)))
             .on_action(cx.listener(|this, _: &Reimport, _window, cx| this.reimport_impl(cx)))
             .bg(cx.theme().colors().panel_background)
-            .child(div().flex_1().min_h_0().child(body))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        gpui::canvas(
+                            move |bounds, window, cx| {
+                                // `rendered_preview_height` clamps
+                                // against these bounds, so a resize has
+                                // to redraw or the band keeps a height
+                                // the pane stopped being able to hold
+                                // for a frame. Deferred rather than
+                                // notified inline: this runs INSIDE the
+                                // draw, where the invalidator drops both
+                                // `notify` and `refresh` on the floor.
+                                let previous = panel_bounds.replace(Some(bounds));
+                                if previous.map(|previous: Bounds<Pixels>| previous.size)
+                                    != Some(bounds.size)
+                                {
+                                    window.defer(cx, move |_, cx| {
+                                        weak.update(cx, |_, cx| cx.notify()).ok();
+                                    });
+                                }
+                            },
+                            |_, (), _, _| {},
+                        )
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                    )
+                    .child(body),
+            )
     }
 }
 
@@ -4715,6 +5174,46 @@ mod tests {
         );
     }
 
+    /// Replacing a sprite's artwork rewrites the tileset its frames --
+    /// and every other sprite bound to that tileset -- address BY INDEX.
+    /// That branch used to confirm with no detail at all while its
+    /// tileset-only sibling listed the cascade, so the more destructive
+    /// of the two prompts said less.
+    #[gpui::test]
+    async fn test_the_replace_artwork_prompt_lists_the_bound_sprites(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let assets = dir.path().join(ASSETS_DIR);
+        commit_sprite(&panel, cx).expect("the baseline sprite import");
+        author_animations(&assets, "art/hero.spr");
+
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.set_as_sprite(true, cx);
+                panel.import_impl(window, cx);
+            })
+        });
+        cx.run_until_parked();
+
+        let (message, detail) = cx.pending_prompt().expect("an existing sprite confirms");
+        assert!(message.contains("replace its artwork"), "{message}");
+        assert!(
+            detail.contains("bound to this tileset"),
+            "the replace prompt must say what else the rewrite reaches: {detail}"
+        );
+        assert!(detail.contains("art/hero.spr"), "{detail}");
+
+        let before = std::fs::read(assets.join("art/hero.spr")).unwrap();
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(
+            std::fs::read(assets.join("art/hero.spr")).unwrap(),
+            before,
+            "cancelling the cascade prompt writes nothing"
+        );
+    }
+
     #[gpui::test]
     async fn test_palette_swaps_reach_the_written_pal(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
@@ -4798,31 +5297,23 @@ mod tests {
         });
     }
 
+    /// The zoom keys are bound at `GgoImportPanel && !Editor`, and the
+    /// destination fields now live in the card -- which carries the same
+    /// key context. Typing `-` into one must reach the editor, not the
+    /// camera.
     #[gpui::test]
     async fn test_zoom_keys_do_not_fire_inside_a_destination_field(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        cx.update(|cx| {
-            AppState::test(cx);
-            init(cx);
-            ggo_common::bind_default_keymap(cx);
-        });
-        write_project(dir.path());
-        let root = dir.path().to_path_buf();
-        let (panel, cx) = cx.add_window_view(|_window, cx| {
-            let mut panel = ImportPanel::new(None, cx);
-            panel.root_override = Some(root);
-            panel
-        });
-        cx.update(|window, _| window.activate_window());
-        panel.update(cx, |panel, cx| {
-            panel.refresh_root(cx);
-            panel.load_source("assets/art/hero.png", cx);
-        });
-        cx.run_until_parked();
-        // The fields are created on the first render; make them and focus the stem editor.
-        panel.update_in(cx, |panel, window, cx| panel.ensure_fields(window, cx));
+        let (_workspace, panel, cx) = card_workspace(cx, dir.path()).await;
+        open_card(cx);
+
         let stem = panel.read_with(cx, |panel, _| {
-            ready(panel).fields.as_ref().unwrap().stem.clone()
+            ready(panel)
+                .fields
+                .as_ref()
+                .expect("the card built the fields")
+                .stem
+                .clone()
         });
         stem.update_in(cx, |editor, window, cx| {
             window.focus(&editor.focus_handle(cx), cx);
@@ -4945,6 +5436,128 @@ mod tests {
         cx.run_until_parked();
     }
 
+    // ------------------------------------------------- the palette's eye
+
+    /// The palette is a section like the sprite panel's clips strip, so
+    /// it hides the way every section in the fork does: an eye on its
+    /// title row, and hidden leaves the title row and nothing else --
+    /// never a section that vanishes with no way back.
+    #[gpui::test]
+    async fn test_the_palette_section_hides_to_its_title_row(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        cx.simulate_resize(size(px(900.), px(700.)));
+        cx.run_until_parked();
+
+        let shown = cx
+            .debug_bounds("ggo-import-palette")
+            .expect("the palette section");
+        assert!(
+            cx.debug_bounds("ggo-import-palette-swatches").is_some(),
+            "the slots are on screen to start with"
+        );
+        let eye = cx
+            .debug_bounds("ggo-import-palette-visible-on")
+            .expect("the section's eye, on");
+
+        cx.simulate_click(eye.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ggo-import-palette-visible-off").is_some(),
+            "the eye flipped, so the way back is still on screen"
+        );
+        assert!(
+            cx.debug_bounds("ggo-import-palette-swatches").is_none(),
+            "and the slots went with it"
+        );
+        let hidden = cx
+            .debug_bounds("ggo-import-palette")
+            .expect("the section itself stays");
+        let title = cx
+            .debug_bounds("ggo-import-palette-header")
+            .expect("its title row stays");
+        assert!(
+            hidden.size.height < shown.size.height,
+            "hiding must give the height back: {hidden:?} vs {shown:?}"
+        );
+        assert!(
+            hidden.size.height <= title.size.height + px(8.),
+            "a hidden section is its title row and nothing else: {hidden:?} vs {title:?}"
+        );
+        panel.read_with(cx, |panel, _| assert!(!panel.palette_visible));
+    }
+
+    // ----------------------------------------- the preview band's divider
+
+    /// The quantized band's height is the user's to set, and the handle
+    /// that sets it sits on the border it moves. The drag is clamped so
+    /// the crop canvas keeps [`CANVAS_MIN_HEIGHT`], and a window
+    /// shortened AFTERWARDS re-clamps at render -- the stored height is
+    /// a preference, not a promise the pane can no longer keep.
+    #[gpui::test]
+    async fn test_the_preview_divider_sizes_the_band_and_a_short_window_reclamps(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+        cx.simulate_resize(size(px(900.), px(700.)));
+        cx.run_until_parked();
+
+        let band = cx
+            .debug_bounds("ggo-import-preview-band")
+            .expect("the quantized preview band");
+        assert_eq!(
+            band.size.height, PREVIEW_HEIGHT,
+            "the band opens at its default height"
+        );
+        let handle = cx
+            .debug_bounds("ggo-import-divider-preview")
+            .expect("the band's drag handle");
+        assert!(
+            (handle.center().y - band.top()).abs() <= DIVIDER_SIZE,
+            "the handle straddles the border it moves: {handle:?} vs band {band:?}"
+        );
+
+        // Drag the border 80px up: the band grows by what the canvas
+        // gives up.
+        panel.update_in(cx, |panel, _window, cx| {
+            panel.drag_preview_divider(point(handle.center().x, band.top() - px(80.)), cx);
+        });
+        cx.run_until_parked();
+        let dragged = cx
+            .debug_bounds("ggo-import-preview-band")
+            .expect("the band after the drag");
+        assert_eq!(
+            dragged.size.height,
+            PREVIEW_HEIGHT + px(80.),
+            "the drag sized the band"
+        );
+
+        // A pane too short to honour that height re-clamps at render,
+        // leaving the canvas its floor rather than the band its drag.
+        cx.simulate_resize(size(px(520.), px(200.)));
+        cx.run_until_parked();
+        let short = cx
+            .debug_bounds("ggo-import-preview-band")
+            .expect("the band in a short pane");
+        assert!(
+            short.size.height <= px(200.) - CANVAS_MIN_HEIGHT,
+            "a short pane must re-clamp the dragged band: {short:?}"
+        );
+        assert!(
+            short.size.height >= MIN_PREVIEW_HEIGHT,
+            "but never below its own floor: {short:?}"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.preview_height,
+                Some(PREVIEW_HEIGHT + px(80.)),
+                "the clamp is a render concern -- widening the pane restores the drag"
+            );
+        });
+    }
+
     /// Overflow class B: the header's control row wraps onto more rows in a
     /// narrow pane instead of running the zoom slider off the edge.
     #[gpui::test]
@@ -5009,4 +5622,194 @@ mod tests {
             after.origin
         );
     }
+
+    // ------------------------------------------------ the destination card
+
+    /// The routed workspace with the fixture PNG loaded through the
+    /// production entry, ready for the destination card.
+    async fn card_workspace<'a>(
+        cx: &'a mut TestAppContext,
+        root: &Path,
+    ) -> (
+        Entity<Workspace>,
+        Entity<ImportPanel>,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        let (workspace, panel, _worktree_id, cx) = routed_workspace(cx, root).await;
+        let handler = import_png_handler(
+            workspace.downgrade(),
+            "assets/art/hero.png".to_string(),
+            None,
+        );
+        cx.update(|window, cx| handler(window, cx));
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        // A deterministic window, and the draw that records the debug
+        // bounds the card is opened through.
+        cx.simulate_resize(size(px(900.), px(700.)));
+        cx.run_until_parked();
+        (workspace, panel, cx)
+    }
+
+    /// Click the footer's "Import…" button -- the only way the card opens.
+    fn open_card(cx: &mut gpui::VisualTestContext) {
+        let button = cx
+            .debug_bounds("ggo-import-open-form")
+            .expect("the footer's Import… button");
+        cx.simulate_click(button.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+    }
+
+    fn open_destination_modal(
+        workspace: &Entity<Workspace>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Option<Entity<DestinationModal>> {
+        workspace.read_with(cx, |workspace, cx| {
+            workspace.active_modal::<DestinationModal>(cx)
+        })
+    }
+
+    /// The destination form is a card over the window, not a form crammed
+    /// into the tab's footer: it opens focused on the first field, and it
+    /// shows what the commit will write.
+    #[gpui::test]
+    async fn test_the_destination_card_opens_with_the_dir_focused(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, cx) = card_workspace(cx, dir.path()).await;
+
+        assert!(
+            open_destination_modal(&workspace, cx).is_none(),
+            "the card is not up until it is asked for"
+        );
+        open_card(cx);
+        assert!(
+            open_destination_modal(&workspace, cx).is_some(),
+            "the footer's button raises the destination card"
+        );
+
+        let dir_field = panel.read_with(cx, |panel, _| {
+            ready(panel)
+                .fields
+                .as_ref()
+                .expect("the card built the fields")
+                .dir
+                .clone()
+        });
+        assert!(
+            cx.update(|window, cx| dir_field.read(cx).focus_handle(cx).is_focused(window)),
+            "the card opens with the destination directory ready to type into"
+        );
+
+        let card = cx.debug_bounds("ggo-import-card").expect("the card");
+        let targets = cx
+            .debug_bounds("ggo-import-target-list")
+            .expect("the files the import will write");
+        assert!(
+            card.contains(&targets.origin) && card.contains(&targets.bottom_right()),
+            "the file list is the card's preview: {targets:?} in {card:?}"
+        );
+    }
+
+    /// Enter on a card field runs the SAME commit the old footer button
+    /// ran, and the card goes away with it.
+    #[gpui::test]
+    async fn test_enter_in_the_card_runs_the_same_commit(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, cx) = card_workspace(cx, dir.path()).await;
+        open_card(cx);
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        assert!(
+            dir.path().join("assets/art/hero.til").exists(),
+            "Enter on a card field commits the import"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.last_import.as_ref().map(|i| i.asset_rel.as_str()),
+                Some("art/hero.til")
+            );
+        });
+        assert!(
+            open_destination_modal(&workspace, cx).is_none(),
+            "and a committed card dismisses itself"
+        );
+    }
+
+    /// Escape cancels the card. It must NOT fall through to the panel's
+    /// own Escape (`ClearCrop`) -- the crop is the tab's state and the
+    /// card is a question about the destination.
+    #[gpui::test]
+    async fn test_escape_dismisses_the_card_and_writes_nothing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, panel, cx) = card_workspace(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            if let ViewerState::Ready(open) = &mut panel.state {
+                open.wizard.commit_region(Some(Region {
+                    x: 0,
+                    y: 0,
+                    w: TILE_PX,
+                    h: TILE_PX,
+                }));
+            }
+            cx.notify();
+        });
+        open_card(cx);
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        assert!(
+            open_destination_modal(&workspace, cx).is_none(),
+            "Escape cancels the card"
+        );
+        assert!(
+            !dir.path().join("assets/art/hero.til").exists(),
+            "a cancelled card writes nothing"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.last_import.is_none());
+            assert!(!panel.form_open, "the panel's form closed with the card");
+            assert!(
+                ready(panel).wizard.region.is_some(),
+                "and Escape in the card left the crop alone"
+            );
+        });
+    }
+
+    /// The card's file list says which of the targets already exist, so
+    /// "this replaces something" is visible before the confirm prompt is.
+    #[gpui::test]
+    async fn test_the_card_flags_the_targets_that_already_exist(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.dest_targets_with_existing(),
+                vec![
+                    ("art/hero.til".to_string(), false),
+                    ("art/hero.pal".to_string(), false),
+                ],
+                "nothing is written yet, so nothing is flagged"
+            );
+        });
+
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| panel.update(cx, |panel, cx| panel.import_impl(window, cx)));
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.dest_targets_with_existing(),
+                vec![
+                    ("art/hero.til".to_string(), true),
+                    ("art/hero.pal".to_string(), true),
+                ],
+                "a second import at the same destination replaces both"
+            );
+        });
+    }
+
 }
