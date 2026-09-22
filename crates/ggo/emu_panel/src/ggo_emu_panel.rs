@@ -82,9 +82,9 @@ mod drive;
 mod emu_item;
 mod hardware;
 mod hardware_item;
-mod job_stream;
 mod ingest;
 mod input;
+mod job_stream;
 mod link;
 mod menu;
 mod stats;
@@ -154,8 +154,17 @@ const LIVE_CONSOLE_TAIL_LINES: usize = 100;
 /// `CONSOLE_HEIGHT`, itself a port of `EmulatorPage.tsx`'s `max-h-64`.
 const CONSOLE_HEIGHT: Pixels = px(200.);
 
-/// The debug column's width: the 512-px sheets scroll inside it.
+/// The debug column's DEFAULT width -- the sheets scroll inside it. A
+/// drag of [`Divider::DebugColumn`] overrides it for the session.
 const DEBUG_COLUMN_PX: f32 = 360.0;
+/// The narrowest a dragged debug column may get. Its tab strip wraps
+/// below this, and a column dragged to a sliver is one the pointer can
+/// no longer find its way back to.
+const MIN_DEBUG_PX: Pixels = px(120.);
+/// The shortest a dragged console may get: one `XSmall` line.
+const MIN_CONSOLE_PX: Pixels = px(16.);
+/// A divider handle's grab width -- `workspace::dock`'s resize strip.
+const DIVIDER_SIZE: Pixels = px(6.);
 /// Palette grid swatch size.
 const DEBUG_SWATCH_PX: f32 = 12.0;
 
@@ -180,6 +189,67 @@ const SCREEN_SELECTOR: &str = "ggo-emu-screen";
 const SCREEN_MESSAGE_SELECTOR: &str = "ggo-emu-screen-message";
 const DEBUG_COLUMN_SELECTOR: &str = "ggo-emu-debug-column";
 const DEBUG_HOVER_SELECTOR: &str = "ggo-emu-debug-hover";
+const CONSOLE_SELECTOR: &str = "ggo-emu-console";
+/// The two eye toggles. `visibility_toggle` appends `-on`/`-off`, which
+/// is what a rendered test clicks and reads back -- an `IconButton`'s id
+/// is not a selector.
+const DEBUG_VISIBLE_TOGGLE: &str = "ggo-emu-debug-visible";
+const CONSOLE_VISIBLE_TOGGLE: &str = "ggo-emu-console-visible";
+
+/// Which of the pane's two session-only dividers a drag is sizing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Divider {
+    /// Between the screen and the debug column: sizes the column.
+    DebugColumn,
+    /// Above the console: sizes the log's scroll region.
+    Console,
+}
+
+/// A divider mid-drag. `workspace::DraggedDock`'s shape: the state rides
+/// on the drag itself and the ghost renders nothing, because the visible
+/// feedback is the resized layout rather than a floating chip.
+///
+/// The [`gpui::EntityId`] is the panel the handle belongs to, and it is
+/// load bearing: `on_drag_move` fires in the CAPTURE phase on every
+/// mounted listener whose drag type matches, with no hitbox test, so a
+/// drag in one emulator pane would otherwise resize another's column too.
+#[derive(Clone, Copy)]
+struct DraggedDivider(Divider, gpui::EntityId);
+
+impl Render for DraggedDivider {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+/// Resolve a divider drag at window position `position` into the new
+/// size of the region that divider controls, clamped so neither side
+/// collapses. `panel` is the whole pane's bounds and `body` the
+/// screen/debug row's.
+///
+/// Pure so the clamps are testable without a window.
+fn divider_size(
+    divider: Divider,
+    position: gpui::Point<Pixels>,
+    panel: Bounds<Pixels>,
+    body: Bounds<Pixels>,
+) -> Pixels {
+    match divider {
+        // Measured LEFT from the body's right edge, which the column
+        // sits against: its own left edge follows the drag, so it cannot
+        // be the edge the width is measured from.
+        Divider::DebugColumn => {
+            let max = (body.size.width - MIN_SCREEN_PX).max(MIN_DEBUG_PX);
+            (body.right() - position.x).clamp(MIN_DEBUG_PX, max)
+        }
+        // Likewise measured UP from the pane's bottom edge, which the
+        // console sits against.
+        Divider::Console => {
+            let max = (panel.size.height - MIN_BODY_PX).max(MIN_CONSOLE_PX);
+            (panel.bottom() - position.y).clamp(MIN_CONSOLE_PX, max)
+        }
+    }
+}
 
 pub fn init(cx: &mut App) {
     // Agent remote-control host (unix socket + on-disk advertisement) --
@@ -515,6 +585,23 @@ pub struct EmuPanel {
     _focus_out: Option<Subscription>,
     /// The debug column -- see [`debug`].
     debug: debug::DebugState,
+    /// The debug column's dragged width, if a drag has set one; `None`
+    /// is [`DEBUG_COLUMN_PX`]. Session-only, like every divider here.
+    debug_width: Option<Pixels>,
+    /// The console log's dragged height, if a drag has set one; `None`
+    /// is [`CONSOLE_HEIGHT`].
+    console_height: Option<Pixels>,
+    /// Live bounds of the whole pane and of the screen/debug row, kept
+    /// for the divider clamps -- what a clamp has to respect is the
+    /// neighbour ON SCREEN, which only a paint knows. Recorded by
+    /// [`EmuPanel::bounds_recorder`].
+    panel_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    body_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    /// Whether the open debug column shows anything but its header row.
+    /// Separate from `debug.open`, which is whether the column is in the
+    /// body at all: the eye collapses it in place, the toolbar's Debug
+    /// button takes it out of the row entirely.
+    debug_visible: bool,
     /// Set by [`Self::auto_pause`] (the tab was hidden); cleared -- and the
     /// run resumed -- by the next render. A user's own pause never sets it,
     /// so it is never auto-resumed.
@@ -583,6 +670,17 @@ pub struct EmuPanel {
     flash_charts_window: Option<AnyWindowHandle>,
     /// The last hardware probe. `None` re-probes on the next ask.
     hardware: Option<hardware::HardwareEnv>,
+    /// Test hook: answer every probe with this env instead of reading the
+    /// machine. Load-bearing for the same reason [`Self::diag_env_override`]
+    /// is -- `hardware::probe` reads `PATH`, `HOME` and `/dev`, all
+    /// process-global, so what a confirmed install/sync/flash actually goes
+    /// on to do could otherwise only be asserted on a machine that happens
+    /// to be set up the right way.
+    hardware_override: Option<hardware::HardwareEnv>,
+    /// The confirm dialog a long or external action is waiting on. Held
+    /// so dropping the panel cancels it rather than leaving a task that
+    /// resolves into a dead entity.
+    _confirm_task: Option<Task<()>>,
     /// The world stem (`arena`) the next flash bakes in as the
     /// cart's boot world.
     ///
@@ -786,6 +884,11 @@ impl EmuPanel {
             run_kind: RunKind::Cart,
             _focus_out,
             debug: debug::DebugState::new(),
+            debug_width: None,
+            console_height: None,
+            panel_bounds: Rc::new(RefCell::new(None)),
+            body_bounds: Rc::new(RefCell::new(None)),
+            debug_visible: true,
             auto_paused: false,
             watch: false,
             watched_world: None,
@@ -805,6 +908,8 @@ impl EmuPanel {
             last_flash_perf_run: None,
             flash_charts_window: None,
             hardware: None,
+            hardware_override: None,
+            _confirm_task: None,
             flash_world: None,
         }
     }
@@ -832,6 +937,9 @@ impl EmuPanel {
     /// This machine's hardware readiness, probed fresh (a setup run, or
     /// plugging the board in, changes the answer).
     fn hardware_env(&self) -> hardware::HardwareEnv {
+        if let Some(env) = &self.hardware_override {
+            return env.clone();
+        }
         hardware::probe(
             self.project_root.as_deref(),
             std::env::var("PATH").ok().as_deref(),
@@ -912,6 +1020,111 @@ impl EmuPanel {
             ..Default::default()
         };
         self.start_flash(config, window, cx).ok();
+    }
+
+    /// The confirm lines for a gateware rebuild: what it costs, and --
+    /// when one is known -- the world the fresh bitstream will boot.
+    ///
+    /// Pure so the wording is assertable without a dialog.
+    fn rebuild_cascade(world: Option<String>) -> Vec<String> {
+        let mut lines = vec!["Rebuilds and flashes the board, about 20 minutes".to_string()];
+        lines.extend(world.map(|world| format!("Bakes world {world}")));
+        lines
+    }
+
+    /// "Flash + rebuild gateware": a place-and-route ties up the machine
+    /// for ~20 minutes and leaves the board holding a different bitstream,
+    /// so it confirms first. [`Self::flash_to_board_with`] with
+    /// `rebuild_gateware` is what a Yes runs.
+    pub(crate) fn confirm_flash_rebuild(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A press while one is in flight means "cancel", which is neither
+        // long nor external -- confirming it would be a dialog in front of
+        // the only way to stop a 20-minute run.
+        if self.is_flashing() {
+            self.flash_to_board_with(None, true, window, cx);
+            return;
+        }
+        let cascade = Self::rebuild_cascade(self.flash_world(cx));
+        self.confirm_then(
+            "Flash and rebuild the gateware?",
+            cascade,
+            "Flash",
+            window,
+            cx,
+            |this, window, cx| this.flash_to_board_with(None, true, window, cx),
+        );
+    }
+
+    /// "Install tools": clones into and writes binaries onto this machine
+    /// from the network, so the prompt names the destination and every
+    /// step that will run.
+    pub(crate) fn confirm_setup_hardware(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_root(cx);
+        self.invalidate_hardware();
+        let env = self.hardware_env_cached();
+        let cascade = hardware::setup_cascade(&env);
+        self.confirm_then(
+            "Install the missing hardware tools?",
+            cascade,
+            "Install",
+            window,
+            cx,
+            |this, _window, cx| this.setup_hardware(cx),
+        );
+    }
+
+    /// "Sync GGO repo": rewrites (and, when the pull cannot fast-forward,
+    /// deletes and re-clones) a directory on this machine, so the prompt
+    /// names it.
+    pub(crate) fn confirm_sync_ggo_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_root(cx);
+        self.invalidate_hardware();
+        let env = self.hardware_env_cached();
+        let Some(cascade) = hardware::sync_cascade(&env) else {
+            // Nothing to confirm, and not a silent no-op either:
+            // `sync_ggo_repo` reports why it cannot.
+            self.sync_ggo_repo(cx);
+            return;
+        };
+        self.confirm_then(
+            "Sync the managed GGO clone?",
+            cascade,
+            "Sync",
+            window,
+            cx,
+            |this, _window, cx| this.sync_ggo_repo(cx),
+        );
+    }
+
+    /// Raise a confirm dialog and run `proceed` on Yes.
+    ///
+    /// `unsaved: false` always: this panel holds no document of its own,
+    /// so there is never an unsaved edit to warn about -- the cascade
+    /// lines carry what IS at stake.
+    fn confirm_then(
+        &mut self,
+        message: &str,
+        cascade: Vec<String>,
+        confirm_label: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        proceed: fn(&mut Self, &mut Window, &mut Context<Self>),
+    ) {
+        let answer = ggo_common::confirm_destructive_cascade(
+            message,
+            &cascade,
+            confirm_label,
+            false,
+            window,
+            cx,
+        );
+        self._confirm_task = Some(cx.spawn_in(window, async move |this, cx| {
+            if !answer.await {
+                return;
+            }
+            this.update_in(cx, |this, window, cx| proceed(this, window, cx))
+                .ok();
+        }));
     }
 
     /// Cancel the flash in flight, if any. Cancelling is not failing: the
@@ -1342,13 +1555,11 @@ impl EmuPanel {
         // background executor and never on the UI thread.
         let local_id = cx
             .background_spawn(async move {
-                let looked_up = connect()
-                    .map_err(|e| format!("{e:#}"))
-                    .and_then(|client| {
-                        client
-                            .diag_perf_run_id(&diag_run_id)
-                            .map_err(|e| format!("{e:#}"))
-                    });
+                let looked_up = connect().map_err(|e| format!("{e:#}")).and_then(|client| {
+                    client
+                        .diag_perf_run_id(&diag_run_id)
+                        .map_err(|e| format!("{e:#}"))
+                });
                 match looked_up {
                     Ok(local_id) => local_id,
                     Err(e) => {
@@ -1422,7 +1633,9 @@ impl EmuPanel {
     /// page's output pane be rendered in a test.
     #[cfg(test)]
     pub(crate) fn push_console_line(&mut self, line: &str) {
-        self.console.get_or_insert_with(UartLog::new).push_line(line);
+        self.console
+            .get_or_insert_with(UartLog::new)
+            .push_line(line);
     }
 
     /// The console's lines, for the setup page's output pane.
@@ -2379,6 +2592,11 @@ impl EmuPanel {
 
     fn toggle_debug(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.debug.open = !self.debug.open;
+        if self.debug.open {
+            // Otherwise a column left collapsed by the eye would make the
+            // toolbar button look broken: pressed, and nothing appears.
+            self.debug_visible = true;
+        }
         if !self.debug.open {
             self.release_debug_images(window);
             self.debug.decoded = None;
@@ -2539,19 +2757,197 @@ impl EmuPanel {
         });
     }
 
-    fn render_debug_column(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let tabs = h_flex()
-            .flex_wrap()
-            .gap_1()
-            .p_1()
-            .children(debug::DebugTab::ALL.into_iter().map(|tab| {
-                Button::new(
-                    SharedString::from(format!("ggo-emu-debug-tab-{}", tab.label())),
-                    tab.label(),
+    /// Apply one step of a divider drag. Drops out before `notify` when
+    /// the clamped size is the one already in force -- a drag emits a
+    /// move event per mouse position, most of which land in the same
+    /// pixel once a clamp is biting.
+    fn drag_divider(
+        &mut self,
+        divider: Divider,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(panel), Some(body)) = (*self.panel_bounds.borrow(), *self.body_bounds.borrow())
+        else {
+            return;
+        };
+        let size = divider_size(divider, position, panel, body);
+        let changed = match divider {
+            Divider::DebugColumn => self.debug_width.replace(size) != Some(size),
+            Divider::Console => self.console_height.replace(size) != Some(size),
+        };
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// The debug column's width AS RENDERED. A dragged width is
+    /// re-clamped against the body's CURRENT width: the drag clamped
+    /// against the width at drag time, and a pane narrowed afterwards
+    /// would otherwise squeeze the screen past its floor and put the
+    /// handle where it cannot be grabbed to undo the state. An untouched
+    /// column keeps [`DEBUG_COLUMN_PX`] whatever the pane does -- the row
+    /// scrolls sideways for that (see [`MIN_SCREEN_PX`]).
+    fn rendered_debug_width(&self) -> Pixels {
+        let Some(width) = self.debug_width else {
+            return px(DEBUG_COLUMN_PX);
+        };
+        let Some(body) = *self.body_bounds.borrow() else {
+            return width;
+        };
+        width.min((body.size.width - MIN_SCREEN_PX).max(MIN_DEBUG_PX))
+    }
+
+    /// The console log's height AS RENDERED, re-clamped against the
+    /// pane's current height for the reason [`Self::rendered_debug_width`]
+    /// re-clamps the width: a pane shortened after the drag must still
+    /// leave the body its floor rather than handing the pane to the log.
+    fn rendered_console_height(&self) -> Pixels {
+        let Some(height) = self.console_height else {
+            return CONSOLE_HEIGHT;
+        };
+        let Some(panel) = *self.panel_bounds.borrow() else {
+            return height;
+        };
+        height.min((panel.size.height - MIN_BODY_PX).max(MIN_CONSOLE_PX))
+    }
+
+    /// One of the two session-only grab handles, sized and positioned by
+    /// the caller. `workspace::dock`'s resize-handle shape: an occluding
+    /// strip that starts a [`DraggedDivider`] drag, which the root's
+    /// `on_drag_move` turns into a size. Callers wrap it in `deferred`
+    /// for the same reason the dock does -- the strip straddles a border,
+    /// and the region on the far side paints after it and would otherwise
+    /// swallow half the grab area.
+    fn divider_handle(divider: Divider, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let name = match divider {
+            Divider::DebugColumn => "ggo-emu-divider-debug",
+            Divider::Console => "ggo-emu-divider-console",
+        };
+        div()
+            .id(name)
+            .debug_selector(|| name.to_string())
+            .on_drag(
+                DraggedDivider(divider, cx.entity_id()),
+                |dragged, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| *dragged)
+                },
+            )
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|_, _: &gpui::MouseDownEvent, _, cx| cx.stop_propagation()),
+            )
+            .occlude()
+    }
+
+    /// A prepaint-only canvas that keeps `cell` holding the bounds of the
+    /// element it fills.
+    ///
+    /// It notifies when they CHANGE, which is what makes the divider
+    /// re-clamps bite in the frame the pane was resized: the clamps read
+    /// these cells, and a cell written during prepaint is written AFTER
+    /// the render that would have used it, so without a redraw every
+    /// re-clamp is one frame late.
+    fn bounds_recorder(
+        &self,
+        cell: Rc<RefCell<Option<Bounds<Pixels>>>>,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        let this = cx.weak_entity();
+        gpui::canvas(
+            move |bounds, _window, cx| {
+                if cell.replace(Some(bounds)) != Some(bounds) {
+                    // DEFERRED, not immediate: `WindowInvalidator`
+                    // silently drops a notify raised while a draw is in
+                    // progress (`window.rs`'s `invalidate_view` bails
+                    // unless `draw_phase` is `None`), and prepaint is
+                    // exactly that. Deferring puts it after the draw, so
+                    // the re-clamp bites in the resize's own frame
+                    // instead of the one after it.
+                    cx.defer(move |cx| {
+                        this.update(cx, |_, cx| cx.notify()).ok();
+                    });
+                }
+            },
+            |_, (), _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .into_any_element()
+    }
+
+    /// The eye that collapses one of the pane's two sections to its
+    /// header row. `SpritePanel::visibility_toggle`'s shape -- the two
+    /// crates share no UI module, so the idiom travels rather than the
+    /// code.
+    fn visibility_toggle(
+        id: &'static str,
+        visible: bool,
+        toggle: fn(&mut EmuPanel, &mut Context<EmuPanel>),
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        div()
+            .debug_selector(move || format!("{id}-{}", if visible { "on" } else { "off" }))
+            .child(
+                IconButton::new(
+                    id,
+                    if visible {
+                        IconName::Eye
+                    } else {
+                        IconName::EyeOff
+                    },
                 )
-                .toggle_state(self.debug.tab == tab)
-                .on_click(cx.listener(move |this, _event, _window, cx| this.set_debug_tab(tab, cx)))
-            }));
+                .icon_size(IconSize::XSmall)
+                .tooltip(ui::Tooltip::text("Show/hide"))
+                .on_click(cx.listener(move |this, _event, _window, cx| toggle(this, cx))),
+            )
+    }
+
+    fn render_debug_column(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let visible = self.debug_visible;
+        let header = h_flex()
+            .items_center()
+            .gap_1()
+            .px_1()
+            .child(Label::new("Debug").size(LabelSize::Small))
+            .child(Self::visibility_toggle(
+                DEBUG_VISIBLE_TOGGLE,
+                visible,
+                |this, cx| {
+                    this.debug_visible = !this.debug_visible;
+                    cx.notify();
+                },
+                cx,
+            ));
+        let column = v_flex()
+            .debug_selector(|| DEBUG_COLUMN_SELECTOR.to_string())
+            .relative()
+            .flex_none()
+            .h_full()
+            .border_l_1()
+            .border_color(cx.theme().colors().border)
+            .child(header);
+        if !visible {
+            return column.into_any_element();
+        }
+        let tabs =
+            h_flex()
+                .flex_wrap()
+                .gap_1()
+                .p_1()
+                .children(debug::DebugTab::ALL.into_iter().map(|tab| {
+                    Button::new(
+                        SharedString::from(format!("ggo-emu-debug-tab-{}", tab.label())),
+                        tab.label(),
+                    )
+                    .toggle_state(self.debug.tab == tab)
+                    .on_click(
+                        cx.listener(move |this, _event, _window, cx| this.set_debug_tab(tab, cx)),
+                    )
+                }));
         let decoded = self
             .debug
             .decoded
@@ -2573,16 +2969,25 @@ impl EmuPanel {
                 debug::DebugTab::Palettes => self.render_debug_palettes(decoded, cx),
             },
         };
-        v_flex()
-            .debug_selector(|| DEBUG_COLUMN_SELECTOR.to_string())
-            .w(px(DEBUG_COLUMN_PX))
-            .flex_none()
-            .h_full()
-            .border_l_1()
-            .border_color(cx.theme().colors().border)
+        column
+            .w(self.rendered_debug_width())
+            .child(gpui::deferred(
+                Self::divider_handle(Divider::DebugColumn, cx)
+                    .absolute()
+                    .top_0()
+                    .left(-DIVIDER_SIZE / 2.)
+                    .w(DIVIDER_SIZE)
+                    .h_full(),
+            ))
             .child(tabs)
             .child(
-                div()
+                // `h_flex`, not `div`: a block container stretches its
+                // child to its own width, so the scroller's content
+                // width would always equal the column's and the fixed
+                // viewer images -- the 320-px OAM screen in a column the
+                // divider can take to 120 -- would clip with no x range
+                // to scroll back along.
+                h_flex()
                     .id("ggo-emu-debug-body")
                     .flex_1()
                     .min_h_0()
@@ -2592,15 +2997,17 @@ impl EmuPanel {
                         // below it, at the bottom of a fixed-height
                         // column, a short pane cut it off with nothing
                         // left to scroll it back into view.
-                        v_flex().child(body).children(self.debug.hover.as_ref().map(
-                            |hover| {
-                                div().debug_selector(|| DEBUG_HOVER_SELECTOR.to_string()).child(
-                                    Label::new(hover.clone())
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                )
-                            },
-                        )),
+                        v_flex()
+                            .child(body)
+                            .children(self.debug.hover.as_ref().map(|hover| {
+                                div()
+                                    .debug_selector(|| DEBUG_HOVER_SELECTOR.to_string())
+                                    .child(
+                                        Label::new(hover.clone())
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                            })),
                     ),
             )
             .into_any_element()
@@ -2643,6 +3050,7 @@ impl EmuPanel {
         .h(px(height as f32));
         div()
             .id(id)
+            .debug_selector(move || id.to_string())
             .w(px(width as f32))
             .h(px(height as f32))
             .child(canvas)
@@ -3080,7 +3488,7 @@ impl EmuPanel {
                                         move |window, cx| {
                                             rebuild
                                                 .update(cx, |this, cx| {
-                                                    this.flash_to_board_with(None, true, window, cx)
+                                                    this.confirm_flash_rebuild(window, cx)
                                                 })
                                                 .ok();
                                         },
@@ -3335,16 +3743,16 @@ impl EmuPanel {
         // `LIVE_CONSOLE_TAIL_LINES` of them.
         let total = log.len();
         let lines = log.peek_tail(LIVE_CONSOLE_TAIL_LINES);
-        let arrow = if self.console_expanded { "▾" } else { "▸" };
-        let toggle = Button::new(
-            "ggo-emu-console",
-            format!("{arrow} Console ({total} lines)"),
-        )
-        .label_size(LabelSize::XSmall)
-        .on_click(cx.listener(|this, _event, _window, cx| {
-            this.console_expanded = !this.console_expanded;
-            cx.notify();
-        }));
+        let visible = self.console_expanded;
+        let toggle = Self::visibility_toggle(
+            CONSOLE_VISIBLE_TOGGLE,
+            visible,
+            |this, cx| {
+                this.console_expanded = !this.console_expanded;
+                cx.notify();
+            },
+            cx,
+        );
         // Copy the WHOLE held log (not just the rendered tail) so a
         // failure's full context can be pasted anywhere.
         let copy_all = {
@@ -3357,10 +3765,10 @@ impl EmuPanel {
                 })
         };
 
-        let body = self.console_expanded.then(|| {
+        let body = visible.then(|| {
             v_flex()
                 .id("ggo-emu-console-lines")
-                .max_h(CONSOLE_HEIGHT)
+                .max_h(self.rendered_console_height())
                 .overflow_y_scroll()
                 .px_1()
                 .children(lines.into_iter().map(|line| {
@@ -3373,11 +3781,28 @@ impl EmuPanel {
 
         Some(
             v_flex()
+                .debug_selector(|| CONSOLE_SELECTOR.to_string())
+                .relative()
                 .border_t_1()
                 .border_color(cx.theme().colors().border)
+                .when(visible, |el| {
+                    el.child(gpui::deferred(
+                        Self::divider_handle(Divider::Console, cx)
+                            .absolute()
+                            .left_0()
+                            .top(-DIVIDER_SIZE / 2.)
+                            .w_full()
+                            .h(DIVIDER_SIZE),
+                    ))
+                })
                 .child(
                     h_flex()
                         .items_center()
+                        .gap_1()
+                        .px_1()
+                        .child(
+                            Label::new(format!("Console ({total} lines)")).size(LabelSize::XSmall),
+                        )
                         .child(toggle)
                         .child(div().flex_1())
                         .child(copy_all),
@@ -3406,7 +3831,7 @@ impl Render for EmuPanel {
         }
         self.debug_tick(cx);
 
-        v_flex()
+        let root = v_flex()
             .id("ggo-emu-root")
             .key_context(KEY_CONTEXT)
             .size_full()
@@ -3447,9 +3872,11 @@ impl Render for EmuPanel {
                 h_flex()
                     .id(BODY_SELECTOR)
                     .debug_selector(|| BODY_SELECTOR.to_string())
+                    .relative()
                     .flex_1()
                     .min_h(MIN_BODY_PX)
                     .overflow_x_scroll()
+                    .child(self.bounds_recorder(self.body_bounds.clone(), cx))
                     .child(
                         div()
                             .debug_selector(|| SCREEN_SELECTOR.to_string())
@@ -3479,7 +3906,27 @@ impl Render for EmuPanel {
                         Color::Muted
                     })
             }))
-            .children(self.render_console(cx))
+            .children(self.render_console(cx));
+
+        div()
+            .relative()
+            .size_full()
+            // The drag listener lives on the whole pane, not on the
+            // handles: a fast drag outruns a 6px strip. It fires in the
+            // CAPTURE phase window-wide with no hitbox test, so it also
+            // sees divider drags from OTHER emulator panes -- hence the
+            // owner filter.
+            .on_drag_move(cx.listener(
+                |this, event: &gpui::DragMoveEvent<DraggedDivider>, _window, cx| {
+                    let &DraggedDivider(divider, owner) = event.drag(cx);
+                    if owner != cx.entity_id() {
+                        return;
+                    }
+                    this.drag_divider(divider, event.event.position, cx);
+                },
+            ))
+            .child(self.bounds_recorder(self.panel_bounds.clone(), cx))
+            .child(root)
     }
 }
 
@@ -4790,7 +5237,9 @@ mod tests {
         assert_eq!(runs.len(), 1, "one run row for one run");
         assert_eq!(runs[0].cart_name, drive::fixture::GREEN_CART_TITLE);
         assert_eq!(runs[0].label.as_deref(), Some("green.cart"));
-        let samples = ggo_charts_panel::loader::load_run_samples(&test_connect(db.url()), runs[0].id).unwrap();
+        let samples =
+            ggo_charts_panel::loader::load_run_samples(&test_connect(db.url()), runs[0].id)
+                .unwrap();
         assert!(
             !samples.frames.is_empty(),
             "the run's perf frames must be readable by the charts panel"
@@ -7251,9 +7700,7 @@ mod tests {
     /// A client over a scripted daemon, for the ingest tests.
     fn fake_connect(fake: &Arc<ggo_daemon_client::FakeDaemon>) -> job_stream::Connect {
         let fake = fake.clone();
-        Arc::new(move || {
-            ggo_daemon_client::Client::with_transport(fake.transport()).map(Arc::new)
-        })
+        Arc::new(move || ggo_daemon_client::Client::with_transport(fake.transport()).map(Arc::new))
     }
 
     /// A daemon that REALLY ingests, into `db_url`.
@@ -8282,6 +8729,191 @@ mod tests {
         );
     }
 
+    // ------------------------------- P4: long and external actions confirm
+
+    /// A panel whose probe answers with `env` rather than with this
+    /// machine, so what a confirmed action goes on to do is the same
+    /// everywhere.
+    fn confirmable_panel<'a>(
+        cx: &'a mut TestAppContext,
+        root: &std::path::Path,
+        streamer: ggo_common::ProcStreamer,
+        env: hardware::HardwareEnv,
+    ) -> (Entity<EmuPanel>, &'a mut gpui::VisualTestContext) {
+        let (panel, cx) = flashable_panel(cx, root, streamer);
+        panel.update(cx, |panel, _cx| {
+            panel.hardware_override = Some(env);
+        });
+        (panel, cx)
+    }
+
+    /// P4: a gateware rebuild ties the machine up for ~20 minutes and
+    /// leaves the board holding a different bitstream. It confirms, the
+    /// prompt says what it costs and which world it bakes, and Cancel
+    /// spawns nothing.
+    #[gpui::test]
+    async fn test_flash_and_rebuild_confirms_before_the_place_and_route(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (streamer, calls) = fake_streamer(vec!["==> Flash board", "RESULT: PASS"], true);
+        let env = ready_hardware(dir.path());
+        let (panel, cx) = confirmable_panel(cx, dir.path(), streamer, env);
+        panel.update(cx, |panel, _cx| panel.remember_flash_world("arena"));
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.confirm_flash_rebuild(window, cx)
+        });
+        let (message, detail) = cx.pending_prompt().expect("a rebuild confirms");
+        assert_eq!(message, "Flash and rebuild the gateware?");
+        assert!(
+            detail.contains("Rebuilds and flashes the board, about 20 minutes"),
+            "the prompt must say what it costs: {detail}"
+        );
+        assert!(
+            detail.contains("Bakes world arena"),
+            "and which world the fresh bitstream boots: {detail}"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "nothing runs while the prompt is up"
+        );
+
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(calls.lock().unwrap().is_empty(), "Cancel spawns nothing");
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.confirm_flash_rebuild(window, cx)
+        });
+        assert!(cx.has_pending_prompt(), "the second press confirms too");
+        cx.simulate_prompt_answer("Flash");
+        cx.run_until_parked();
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "confirming flashed: {calls:?}");
+        assert!(
+            !calls[0].args.iter().any(|arg| arg == "--skip-pnr"),
+            "and it is the REBUILD, not the cached bitstream: {:?}",
+            calls[0].args
+        );
+    }
+
+    /// The rebuild prompt with no world remembered: the cost line stands
+    /// alone rather than inventing a world name.
+    #[gpui::test]
+    fn the_rebuild_cascade_omits_a_world_it_does_not_know() {
+        assert_eq!(
+            EmuPanel::rebuild_cascade(None),
+            vec!["Rebuilds and flashes the board, about 20 minutes".to_string()]
+        );
+    }
+
+    /// P4: "Install tools" clones from the network and writes binaries
+    /// onto this machine. It confirms, naming the destination and every
+    /// step, and Cancel spawns nothing.
+    #[gpui::test]
+    async fn test_installing_tools_confirms_with_the_destination(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (streamer, calls) = fake_streamer(vec!["done"], true);
+        let mut env = ready_hardware(dir.path());
+        env.diag_bin = None;
+        env.emd_bin = None;
+        let (panel, cx) = confirmable_panel(cx, dir.path(), streamer, env);
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.confirm_setup_hardware(window, cx)
+        });
+        let (message, detail) = cx.pending_prompt().expect("an install confirms");
+        assert_eq!(message, "Install the missing hardware tools?");
+        assert!(
+            detail.contains(&dir.path().join("repo").display().to_string()),
+            "the prompt must name where it writes: {detail}"
+        );
+        assert!(
+            detail.contains("install ggo") && detail.contains("install emd"),
+            "and what it writes: {detail}"
+        );
+
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(calls.lock().unwrap().is_empty(), "Cancel spawns nothing");
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.confirm_setup_hardware(window, cx)
+        });
+        cx.simulate_prompt_answer("Install");
+        cx.run_until_parked();
+        assert!(
+            !calls.lock().unwrap().is_empty(),
+            "confirming ran the install steps"
+        );
+    }
+
+    /// P4: "Sync GGO repo" rewrites -- and, when the pull cannot
+    /// fast-forward, deletes and re-clones -- a directory on this
+    /// machine, so the prompt names it. Cancel spawns nothing.
+    #[gpui::test]
+    async fn test_syncing_the_repo_confirms_with_the_destination(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (streamer, calls) = fake_streamer(vec!["Already up to date."], true);
+        let mut env = ready_hardware(dir.path());
+        // Only the clone this fork manages is syncable at all.
+        env.repo = Some(env.clone_dest.clone());
+        let clone = env.clone_dest.display().to_string();
+        let (panel, cx) = confirmable_panel(cx, dir.path(), streamer, env);
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.confirm_sync_ggo_repo(window, cx)
+        });
+        let (message, detail) = cx.pending_prompt().expect("a sync confirms");
+        assert_eq!(message, "Sync the managed GGO clone?");
+        assert!(
+            detail.contains(&clone),
+            "the prompt must name the directory it rewrites: {detail}"
+        );
+        assert!(
+            detail.contains("re-clones"),
+            "including that a diverged clone is deleted: {detail}"
+        );
+
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(calls.lock().unwrap().is_empty(), "Cancel spawns nothing");
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.confirm_sync_ggo_repo(window, cx)
+        });
+        cx.simulate_prompt_answer("Sync");
+        cx.run_until_parked();
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "confirming ran the sync script"
+        );
+    }
+
+    /// A machine with no managed clone has nothing to confirm, and the
+    /// press must still say why rather than doing nothing.
+    #[gpui::test]
+    async fn test_syncing_without_a_managed_clone_reports_instead(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (streamer, calls) = fake_streamer(vec![], true);
+        let env = ready_hardware(dir.path());
+        let (panel, cx) = confirmable_panel(cx, dir.path(), streamer, env);
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.confirm_sync_ggo_repo(window, cx)
+        });
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt(), "nothing to confirm");
+        assert!(calls.lock().unwrap().is_empty(), "and nothing spawned");
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.status_is_error && panel.status.is_some(),
+                "but the press is answered: {:?}",
+                panel.status
+            );
+        });
+    }
+
     /// A machine with nothing set up spawns NOTHING and names every gap.
     #[gpui::test]
     async fn test_flashing_without_the_prerequisites_spawns_nothing(cx: &mut TestAppContext) {
@@ -9033,11 +9665,301 @@ mod tests {
         );
     }
 
+    /// P9: the debug viewers are fixed-size images -- the OAM view is
+    /// the whole 320x240 screen -- inside a column the divider can make
+    /// narrower than they are. They have to scroll sideways rather than
+    /// be clipped with no way back to them.
+    #[gpui::test]
+    async fn test_a_debug_canvas_wider_than_its_column_scrolls_sideways(cx: &mut TestAppContext) {
+        let (panel, cx) = debug_column_panel(cx);
+        resize(cx, 900., 600.);
+        let mut ppu = ggo_emu_core::ppu::Ppu::new();
+        ppu.set_layer(2, true, 1);
+        panel.update(cx, |panel, cx| {
+            panel.set_debug_tab(debug::DebugTab::Oam, cx);
+            panel.debug_width = Some(px(150.));
+            panel.debug_decode_now(Arc::new(ppu.snapshot()));
+        });
+        cx.run_until_parked();
+
+        let column = cx
+            .debug_bounds(DEBUG_COLUMN_SELECTOR)
+            .expect("the debug column is painted");
+        let before = cx
+            .debug_bounds("ggo-emu-debug-oam")
+            .expect("the OAM canvas is painted");
+        assert!(
+            before.size.width > column.size.width,
+            "the fixture must actually overflow the column: \
+             canvas {before:?}, column {column:?}"
+        );
+
+        wheel(cx, column.center(), -200., 0.);
+
+        let after = cx
+            .debug_bounds("ggo-emu-debug-oam")
+            .expect("the OAM canvas after the scroll");
+        assert!(
+            after.origin.x < before.origin.x,
+            "a sideways wheel must scroll the debug body to the rest of \
+             the canvas: before {:?}, after {:?}",
+            before.origin,
+            after.origin
+        );
+    }
+
+    // -------------------------------------------------- P7: dividers
+
+    /// Both dividers' sizing math and its clamps: each tracks the
+    /// pointer inside its usable range, and at the extremes leaves the
+    /// region on the far side its minimum rather than collapsing it.
+    #[gpui::test]
+    fn test_divider_size_tracks_the_pointer_and_clamps_its_neighbour() {
+        // A 1000x500 body at (100, 50) inside a 1000x700 pane at (100, 0).
+        let panel = Bounds::new(point(px(100.), px(0.)), size(px(1000.), px(700.)));
+        let body = Bounds::new(point(px(100.), px(50.)), size(px(1000.), px(500.)));
+        let at = |divider, x: f32, y: f32| divider_size(divider, point(px(x), px(y)), panel, body);
+
+        // The column runs from the pointer to the body's right edge (1100).
+        assert_eq!(at(Divider::DebugColumn, 740., 300.), px(360.));
+        // Dragged off the right edge: the column keeps its own minimum.
+        assert_eq!(at(Divider::DebugColumn, 1100., 300.), MIN_DEBUG_PX);
+        // Dragged off the left edge: the screen keeps its floor.
+        assert_eq!(
+            at(Divider::DebugColumn, 0., 300.),
+            px(1000.) - MIN_SCREEN_PX
+        );
+
+        // The console runs from the pointer DOWN to the pane's bottom
+        // edge (700), so dragging up makes it taller.
+        assert_eq!(at(Divider::Console, 600., 500.), px(200.));
+        // Dragged past the bottom: the log keeps one line.
+        assert_eq!(at(Divider::Console, 600., 700.), MIN_CONSOLE_PX);
+        // Dragged off the top: the rest of the pane keeps its floor.
+        assert_eq!(at(Divider::Console, 600., 0.), px(700.) - MIN_BODY_PX);
+    }
+
+    /// The whole rendered gesture on the debug divider: the handle
+    /// straddles the column's left edge, starts the drag, and the pane's
+    /// `on_drag_move` turns it into a width. A pane narrowed afterwards
+    /// re-clamps that width so the screen keeps [`MIN_SCREEN_PX`] --
+    /// within the resize's own frame, because the bounds recorder
+    /// notifies when the bounds it holds change.
+    #[gpui::test]
+    async fn test_the_debug_divider_resizes_the_column(cx: &mut TestAppContext) {
+        let (panel, cx) = debug_column_panel(cx);
+        resize(cx, 900., 600.);
+
+        let before = cx
+            .debug_bounds(DEBUG_COLUMN_SELECTOR)
+            .expect("the debug column is painted");
+        let handle = cx
+            .debug_bounds("ggo-emu-divider-debug")
+            .expect("the debug divider handle is painted");
+        assert!(
+            (handle.center().x - before.origin.x).abs() <= DIVIDER_SIZE,
+            "the handle must straddle the column's left edge: {handle:?} over {before:?}"
+        );
+
+        let target = point(before.origin.x - px(120.), before.center().y);
+        drag_to(cx, handle.center(), target);
+
+        let after = cx
+            .debug_bounds(DEBUG_COLUMN_SELECTOR)
+            .expect("the debug column after the drag");
+        assert!(
+            (after.size.width - before.size.width - px(120.)).abs() < px(2.),
+            "dragging 120px left must make the column 120px wider: \
+             before {:?}, after {:?}",
+            before.size,
+            after.size
+        );
+
+        resize(cx, 400., 600.);
+        let narrow = cx
+            .debug_bounds(DEBUG_COLUMN_SELECTOR)
+            .expect("the debug column after the resize");
+        assert!(
+            narrow.size.width <= px(400.) - MIN_SCREEN_PX,
+            "a narrowed pane must re-clamp the dragged column: {narrow:?}"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.debug_width,
+                Some(after.size.width),
+                "the clamp is a render concern -- the dragged width survives it"
+            );
+        });
+    }
+
+    /// The same gesture on the console divider, which sizes the log's
+    /// scroll region, plus the re-clamp a shortened pane forces.
+    #[gpui::test]
+    async fn test_the_console_divider_resizes_the_log(cx: &mut TestAppContext) {
+        let (panel, cx) = windowed_panel(cx);
+        resize(cx, 900., 600.);
+        panel.update(cx, |panel, cx| {
+            let log = uart::UartLog::new();
+            for index in 0..LIVE_CONSOLE_TAIL_LINES {
+                log.push_line(format!("[run] line {index}"));
+            }
+            panel.console = Some(log);
+            panel.console_expanded = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let before = cx
+            .debug_bounds(CONSOLE_SELECTOR)
+            .expect("the console is painted");
+        let handle = cx
+            .debug_bounds("ggo-emu-divider-console")
+            .expect("the console divider handle is painted");
+        assert!(
+            (handle.center().y - before.origin.y).abs() <= DIVIDER_SIZE,
+            "the handle must straddle the console's top edge: {handle:?} over {before:?}"
+        );
+
+        let target = point(before.center().x, before.origin.y - px(100.));
+        drag_to(cx, handle.center(), target);
+
+        let after = cx
+            .debug_bounds(CONSOLE_SELECTOR)
+            .expect("the console after the drag");
+        assert!(
+            after.size.height > before.size.height + px(50.),
+            "dragging the divider up must grow the log: before {:?}, after {:?}",
+            before.size,
+            after.size
+        );
+
+        resize(cx, 900., 260.);
+        let short = cx
+            .debug_bounds(CONSOLE_SELECTOR)
+            .expect("the console after the resize");
+        assert!(
+            short.size.height < after.size.height,
+            "a shortened pane must re-clamp the dragged log: \
+             was {:?}, now {short:?}",
+            after.size
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.console_height.is_some(),
+                "the dragged height survives the clamp"
+            );
+        });
+    }
+
+    // -------------------------------------------- P6: sections and eyes
+
+    /// P6: the debug column carries a header with an eye, and hiding it
+    /// leaves the header -- the title stays, so the column can be
+    /// brought back without going via the toolbar.
+    #[gpui::test]
+    async fn test_the_debug_column_collapses_to_its_header(cx: &mut TestAppContext) {
+        let (_panel, cx) = debug_column_panel(cx);
+        resize(cx, 900., 600.);
+
+        assert!(
+            cx.debug_bounds("ggo-emu-debug-visible-on").is_some(),
+            "the open column shows the eye"
+        );
+        let open = cx
+            .debug_bounds(DEBUG_COLUMN_SELECTOR)
+            .expect("the debug column is rendered");
+        assert!(
+            open.size.width >= px(DEBUG_COLUMN_PX),
+            "the open column is its full width: {open:?}"
+        );
+
+        click(cx, "ggo-emu-debug-visible-on");
+
+        let collapsed = cx
+            .debug_bounds(DEBUG_COLUMN_SELECTOR)
+            .expect("the header row stays");
+        assert!(
+            cx.debug_bounds("ggo-emu-debug-visible-off").is_some(),
+            "the eye is now the closed one"
+        );
+        assert!(
+            collapsed.size.width < open.size.width,
+            "hiding it leaves the header row only: open {open:?}, \
+             collapsed {collapsed:?}"
+        );
+
+        click(cx, "ggo-emu-debug-visible-off");
+        let reopened = cx
+            .debug_bounds(DEBUG_COLUMN_SELECTOR)
+            .expect("the column comes back");
+        assert!(
+            reopened.size.width >= px(DEBUG_COLUMN_PX),
+            "and the same eye brings it back: {reopened:?}"
+        );
+    }
+
+    /// P6: the console's own eye. It replaced a text arrow inside the
+    /// title button, so the title is still there and the toggle is the
+    /// same Eye/EyeOff the debug column and the sprite panel use.
+    #[gpui::test]
+    async fn test_the_console_eye_expands_and_collapses_it(cx: &mut TestAppContext) {
+        let (panel, cx) = windowed_panel(cx);
+        resize(cx, 900., 600.);
+        panel.update(cx, |panel, cx| {
+            let log = uart::UartLog::new();
+            for index in 0..40 {
+                log.push_line(format!("[run] line {index}"));
+            }
+            panel.console = Some(log);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ggo-emu-console-visible-off").is_some(),
+            "a fresh console is collapsed, and says so with the closed eye"
+        );
+        let collapsed = cx
+            .debug_bounds(CONSOLE_SELECTOR)
+            .expect("the console header is rendered");
+
+        click(cx, "ggo-emu-console-visible-off");
+        panel.read_with(cx, |panel, _| assert!(panel.console_expanded));
+        let expanded = cx
+            .debug_bounds(CONSOLE_SELECTOR)
+            .expect("the console is rendered expanded");
+        assert!(
+            expanded.size.height > collapsed.size.height,
+            "the eye opened the log: collapsed {collapsed:?}, \
+             expanded {expanded:?}"
+        );
+
+        click(cx, "ggo-emu-console-visible-on");
+        panel.read_with(cx, |panel, _| assert!(!panel.console_expanded));
+    }
+
     // ------------------------------------------------ layout / overflow
 
     /// Resize the window and let the panel redraw at the new size.
     fn resize(cx: &mut gpui::VisualTestContext, width: f32, height: f32) {
         cx.simulate_resize(size(px(width), px(height)));
+        cx.run_until_parked();
+    }
+
+    /// The whole rendered divider gesture: press the handle, move to
+    /// `to`, release. The second move is not redundant -- the first is
+    /// what `on_drag` turns into a drag, and only moves after it carry a
+    /// `DragMoveEvent`.
+    fn drag_to(
+        cx: &mut gpui::VisualTestContext,
+        from: gpui::Point<Pixels>,
+        to: gpui::Point<Pixels>,
+    ) {
+        cx.simulate_mouse_move(from, None, gpui::Modifiers::default());
+        cx.simulate_mouse_down(from, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(to, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(to, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_up(to, gpui::MouseButton::Left, gpui::Modifiers::default());
         cx.run_until_parked();
     }
 
@@ -9095,7 +10017,9 @@ mod tests {
             .expect("hover readout bounds recorded at paint");
         let before_offset = before.origin.y - column.origin.y;
 
-        wheel(cx, column.origin + point(px(20.), px(40.)), 0., -120.);
+        // Down the column rather than at its top: the first rows are the
+        // header and the tab strip now, neither of which is the scroller.
+        wheel(cx, column.center(), 0., -120.);
 
         let column = cx
             .debug_bounds(DEBUG_COLUMN_SELECTOR)

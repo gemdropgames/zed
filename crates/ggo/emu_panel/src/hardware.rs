@@ -1076,6 +1076,38 @@ pub fn setup_steps(env: &HardwareEnv) -> Vec<SetupStep> {
     steps
 }
 
+/// What an "Install tools" press will write, and where -- the confirm
+/// dialog's cascade lines. The destination comes first because that is
+/// the part a reader cannot get from the step labels alone, and the
+/// steps are [`setup_steps`]'s own labels so the prompt can never
+/// describe a run different from the one it starts.
+pub fn setup_cascade(env: &HardwareEnv) -> Vec<String> {
+    let repo = env.repo.clone().unwrap_or_else(|| env.clone_dest.clone());
+    let mut lines = vec![format!("Into {}", repo.display())];
+    let steps = setup_steps(env);
+    if steps.is_empty() {
+        lines.push("Nothing left for ZedGG to install".to_string());
+        return lines;
+    }
+    lines.extend(steps.into_iter().map(|step| step.label));
+    lines
+}
+
+/// What a "Sync GGO repo" press will do to which directory -- the
+/// confirm dialog's cascade lines. `None` when there is no managed clone
+/// to sync, which is [`HardwareEnv::sync_request`]'s own condition.
+pub fn sync_cascade(env: &HardwareEnv) -> Option<Vec<String>> {
+    let repo = env.repo.clone().filter(|_| env.sync_request().is_some())?;
+    Some(vec![
+        format!("Pulls {GGO_REPO_URL} into {}", repo.display()),
+        format!(
+            "Deletes and re-clones {} if the pull cannot fast-forward",
+            repo.display()
+        ),
+        format!("Reinstalls {GGO_BIN} from the synced source"),
+    ])
+}
+
 /// `cargo install` from a local checkout when there is one, else from
 /// git. `--path` is `root/sub`; the fallback fetches `crate_name` out of
 /// `url`. Runs in `cwd`, which the caller guarantees exists.
@@ -1612,7 +1644,12 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            flash_args(Path::new("/ggo"), Path::new("/game"), "/dev/ttyUSB0", &config),
+            flash_args(
+                Path::new("/ggo"),
+                Path::new("/game"),
+                "/dev/ttyUSB0",
+                &config
+            ),
             vec![
                 "diag",
                 "--repo",
@@ -1638,7 +1675,12 @@ mod tests {
             telemetry: true,
         };
         assert_eq!(
-            flash_args(Path::new("/ggo"), Path::new("/game"), "/dev/ttyUSB3", &config),
+            flash_args(
+                Path::new("/ggo"),
+                Path::new("/game"),
+                "/dev/ttyUSB3",
+                &config
+            ),
             vec![
                 "diag",
                 "--repo",
@@ -1655,7 +1697,12 @@ mod tests {
                 "--telemetry"
             ],
         );
-        let args = flash_args(Path::new("/ggo"), Path::new("/game"), "/dev/ttyUSB0", &FlashConfig::default());
+        let args = flash_args(
+            Path::new("/ggo"),
+            Path::new("/game"),
+            "/dev/ttyUSB0",
+            &FlashConfig::default(),
+        );
         for flag in ["--baud", "--collect-seconds", "--telemetry", "--world"] {
             assert!(!args.contains(&flag.to_string()), "{flag} in {args:?}");
         }
@@ -1724,7 +1771,12 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            flash_args(Path::new("/ggo"), Path::new("/game"), "/dev/ttyUSB0", &arena),
+            flash_args(
+                Path::new("/ggo"),
+                Path::new("/game"),
+                "/dev/ttyUSB0",
+                &arena
+            ),
             vec![
                 "diag",
                 "--repo",
@@ -1743,7 +1795,12 @@ mod tests {
             ..arena
         };
         assert_eq!(
-            flash_args(Path::new("/ggo"), Path::new("/game"), "/dev/ttyUSB0", &arena_full),
+            flash_args(
+                Path::new("/ggo"),
+                Path::new("/game"),
+                "/dev/ttyUSB0",
+                &arena_full
+            ),
             vec![
                 "diag",
                 "--repo",

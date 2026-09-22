@@ -330,8 +330,10 @@ impl HardwareSetupItem {
             }))
             .on_click({
                 let panel = self.panel.clone();
-                move |_, _window, cx| {
-                    panel.update(cx, |panel, cx| panel.sync_ggo_repo(cx)).ok();
+                move |_, window, cx| {
+                    panel
+                        .update(cx, |panel, cx| panel.confirm_sync_ggo_repo(window, cx))
+                        .ok();
                 }
             })
             .into_any_element()
@@ -572,8 +574,12 @@ impl Render for HardwareSetupItem {
                                 }))
                                 .on_click({
                                     let panel = self.panel.clone();
-                                    move |_, _window, cx| {
-                                        panel.update(cx, |panel, cx| panel.setup_hardware(cx)).ok();
+                                    move |_, window, cx| {
+                                        panel
+                                            .update(cx, |panel, cx| {
+                                                panel.confirm_setup_hardware(window, cx)
+                                            })
+                                            .ok();
                                     }
                                 }),
                         )
@@ -623,7 +629,7 @@ impl Render for HardwareSetupItem {
                                     move |_, window, cx| {
                                         panel
                                             .update(cx, |panel, cx| {
-                                                panel.flash_to_board_with(None, true, window, cx)
+                                                panel.confirm_flash_rebuild(window, cx)
                                             })
                                             .ok();
                                     }
