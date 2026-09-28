@@ -14,8 +14,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::time::Duration;
 
+use base64::Engine as _;
 use ggo_daemon_client::Connect;
-use ggo_emu_remote::protocol::{Cmd, FlashConfig, Request, Response};
+use ggo_emu_remote::protocol::{Cmd, ClipEntryArg, ClipRef, FlashConfig, Request, Response};
 use ggo_emu_remote::registry::{self, SessionInfo};
 use serde_json::{Value, json};
 
@@ -50,6 +51,28 @@ const PACK_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_STEP_FRAMES: i64 = 60_000;
 
 /// The MCP `tools/list` payload.
+/// `sprite_clip_create`/`sprite_clip_update`'s shared `entries` schema,
+/// factored out of `tool_list`'s own `json!` call rather than inlined
+/// twice: nested two levels deeper than everything else there, inlining
+/// it into both tools' schemas pushes `json!`'s macro expansion past the
+/// default recursion limit.
+fn clip_entries_schema() -> Value {
+    json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "frame": { "type": "integer", "description": "Frame index this entry plays" },
+                "duration_ms": { "type": "integer", "description": "Milliseconds this entry holds (default 100)" },
+                "flip_h": { "type": "boolean" },
+                "flip_v": { "type": "boolean" },
+                "offset": { "type": "array", "items": { "type": "integer" }, "description": "[dx, dy] pixel offset (default [0, 0])" }
+            },
+            "required": ["frame"]
+        }
+    })
+}
+
 pub fn tool_list() -> Value {
     let session_props = json!({
         "session": { "type": "number", "description": "Target Zed process id from zed_sessions (optional when only one is live)" },
@@ -165,6 +188,50 @@ pub fn tool_list() -> Value {
               "world": { "type": "string", "description": "Open this world first (stem or rel path); omit for the open one" },
               "full": { "type": "boolean", "description": "Frame the whole scene instead of the device screen" }
           })) },
+        { "name": "sprite_list",
+          "description": "Every .spr file in the open project: {sprites: [{stem, rel_path}]}.",
+          "inputSchema": with(json!({})) },
+        { "name": "sprite_read",
+          "description": "The open sprite as authored, from the Sprite panel: {stem, rel_path, dirty, tileset: {stem, rel_path}, frame_count, frame_size: {tiles: [w, h], pixels: [w, h]}, clips: [{index, name, loop, entries: [{frame, duration_ms, flip_h, flip_v, offset: [dx, dy], transform?}]}]}. `transform` (angle256/sx/sy/shear_x/shear_y) is present only on an entry that carries a rotation or scale, not a plain flip. Pass `sprite` to open it first — a sprite that already has a tab is focused, never reloaded, so unsaved edits and undo survive.",
+          "inputSchema": with(json!({ "sprite": { "type": "string", "description": "Open this sprite first (stem or rel path); omit to read the one already open" } })) },
+        { "name": "sprite_clip_create",
+          "description": "Add a new clip to a sprite's document: {sprite, name, loop, entries: [{frame, duration_ms, flip_h, flip_v, offset}]}. entries defaults to []; loop defaults to false; an entry's duration_ms/flip_h/flip_v/offset default to a plain 100ms unflipped frame with no offset when omitted. Returns the new clip's sprite_read-shape JSON ({index, name, loop, entries}). A bad frame reference or a name over the length limit comes back as an error, not a bad write. LEAVES THE SPRITE UNSAVED — call sprite_save when you're done editing clips (by default, after finishing a batch of edits).",
+          "inputSchema": with(json!({
+              "sprite": { "type": "string", "description": "Sprite stem or rel path" },
+              "name": { "type": "string", "description": "Clip name" },
+              "loop": { "type": "boolean", "description": "Loop the clip (default false)" },
+              "entries": clip_entries_schema()
+          })) },
+        { "name": "sprite_clip_update",
+          "description": "Merge fields into an existing clip: {sprite, clip, name?, loop?, entries?}. Any field left out keeps the clip's current value (entries replaces the whole sequence when given, it does not append). `clip` may be an index or a clip's name; a name shared by more than one clip errors and asks for an index instead of guessing. LEAVES THE SPRITE UNSAVED — call sprite_save when you're done editing clips (by default, after finishing a batch of edits).",
+          "inputSchema": with(json!({
+              "sprite": { "type": "string", "description": "Sprite stem or rel path" },
+              "clip": { "type": ["integer", "string"], "description": "Clip index or (unique) name" },
+              "name": { "type": "string" },
+              "loop": { "type": "boolean" },
+              "entries": clip_entries_schema()
+          })) },
+        { "name": "sprite_clip_delete",
+          "description": "Delete a clip: {sprite, clip} (an index or a unique name; an ambiguous name errors and asks for an index). Returns {index, name} of what was removed. LEAVES THE SPRITE UNSAVED — call sprite_save when you're done editing clips (by default, after finishing a batch of edits).",
+          "inputSchema": with(json!({
+              "sprite": { "type": "string", "description": "Sprite stem or rel path" },
+              "clip": { "type": ["integer", "string"], "description": "Clip index or (unique) name" }
+          })) },
+        { "name": "sprite_save",
+          "description": "Save the open sprite's unsaved edits to disk — the same write the editor's own Save does. Returns {saved: rel_path}. Call this after a batch of sprite_clip_create/update/delete calls: they leave the document dirty on purpose (so several edits fold into one save) and nothing else persists them.",
+          "inputSchema": with(json!({ "sprite": { "type": "string", "description": "Sprite stem or rel path" } })) },
+        { "name": "sprite_reference_sheet",
+          "description": "The bound tileset's recorded reference sheet as a PNG, plus {cols, rows, tiles} (tiles are pool indices, row-major). This is the SOURCE ARTWORK in its ORIGINAL LAYOUT — poses, facing, sequence order, exactly as it was drawn and imported — not the pool's scrambled tile order. Look at this before creating or editing clips: it is how you tell which pool tile is which pose/frame of the sprite. Errors when no sheet was ever recorded for this sprite's tileset, or it no longer fits the pool (a re-import, a manual dedup). Pass `path` (absolute, or relative to the workspace root) to also write the PNG to disk; the reply then includes {written: path}.",
+          "inputSchema": with(json!({
+              "sprite": { "type": "string", "description": "Sprite stem or rel path" },
+              "path": { "type": "string", "description": "Also write the PNG here (absolute, or relative to the workspace root)" }
+          })) },
+        { "name": "sprite_tileset_image",
+          "description": "The sprite's bound tileset pool as one PNG grid, 16 tiles per row, every pool tile (including blanks) in pool-index order — the raw pool, not the reference sheet's original layout. Pass `path` (absolute, or relative to the workspace root) to also write the PNG to disk; the reply then includes {written: path}.",
+          "inputSchema": with(json!({
+              "sprite": { "type": "string", "description": "Sprite stem or rel path" },
+              "path": { "type": "string", "description": "Also write the PNG here (absolute, or relative to the workspace root)" }
+          })) },
     ] })
 }
 
@@ -215,6 +282,63 @@ fn arg_str(args: &Value, key: &str) -> Option<String> {
 fn arg_i64(args: &Value, key: &str) -> Option<i64> {
     let v = args.get(key)?;
     v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))
+}
+
+/// `clip`: an index (a non-negative number) or a name (a string).
+fn arg_clip_ref(args: &Value, key: &str) -> Result<ClipRef, String> {
+    match args.get(key) {
+        Some(v) if v.is_string() => Ok(ClipRef::Name(v.as_str().expect("checked is_string").to_string())),
+        Some(v) if v.is_number() => match v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)) {
+            Some(n) if n >= 0 => Ok(ClipRef::Index(n as usize)),
+            _ => Err(format!("{key} must be a non-negative index")),
+        },
+        _ => Err(format!("missing required argument: {key} (a clip index or name)")),
+    }
+}
+
+/// `entries`: a JSON array of `{frame, duration_ms?, flip_h?, flip_v?,
+/// offset?}`, or an absent key (an update that leaves entries alone).
+fn arg_clip_entries(args: &Value, key: &str) -> Result<Option<Vec<ClipEntryArg>>, String> {
+    let Some(entries) = args.get(key) else {
+        return Ok(None);
+    };
+    let entries = entries.as_array().ok_or_else(|| format!("{key} must be an array"))?;
+    entries.iter().map(arg_clip_entry).collect::<Result<Vec<_>, _>>().map(Some)
+}
+
+fn arg_clip_entry(entry: &Value) -> Result<ClipEntryArg, String> {
+    let frame = entry
+        .get("frame")
+        .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
+        .filter(|&n| n >= 0)
+        .ok_or_else(|| format!("clip entry missing a valid non-negative frame: {entry}"))?;
+    let offset = match entry.get("offset").and_then(Value::as_array) {
+        Some(pair) => {
+            let bad = || format!("offset must be [dx, dy]: {entry}");
+            let dx = pair.first().and_then(Value::as_i64).ok_or_else(bad)?;
+            let dy = pair.get(1).and_then(Value::as_i64).ok_or_else(bad)?;
+            Some((dx as i16, dy as i16))
+        }
+        None => None,
+    };
+    Ok(ClipEntryArg {
+        frame: frame as usize,
+        duration_ms: entry.get("duration_ms").and_then(Value::as_u64).map(|n| n as u16),
+        flip_h: entry.get("flip_h").and_then(Value::as_bool).unwrap_or(false),
+        flip_v: entry.get("flip_v").and_then(Value::as_bool).unwrap_or(false),
+        offset,
+    })
+}
+
+/// Base64-decode an [`image_content`] block's embedded PNG and write it
+/// to `path` -- the disk-write half of `sprite_reference_sheet`/
+/// `sprite_tileset_image`'s optional `path` argument. The encoder is
+/// `image_content`'s own; this only persists what it already built.
+fn write_image_to_disk(image: &Value, path: &str) -> Result<(), String> {
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(image["data"].as_str().unwrap_or_default())
+        .map_err(|e| e.to_string())?;
+    std::fs::write(path, &png).map_err(|e| format!("failed to write {path}: {e}"))
 }
 
 /// A `{width, height, bgra_base64}` reply as MCP PNG image content.
@@ -495,6 +619,100 @@ fn call_tool_inner(
                 connect,
             )?;
             Ok(vec![image_content(&data)?])
+        }
+        "sprite_list" => {
+            let data = send(&session.socket, Cmd::SpriteList { workspace }, CALL_TIMEOUT, connect)?;
+            Ok(vec![json!({ "type": "text", "text": data.to_string() })])
+        }
+        "sprite_read" => {
+            let sprite = arg_str(args, "sprite");
+            let data =
+                send(&session.socket, Cmd::SpriteRead { workspace, sprite }, CALL_TIMEOUT, connect)?;
+            Ok(vec![json!({ "type": "text", "text": data.to_string() })])
+        }
+        "sprite_clip_create" => {
+            let sprite = arg_str(args, "sprite").ok_or("missing required argument: sprite")?;
+            let name = arg_str(args, "name").ok_or("missing required argument: name")?;
+            let loop_ = args.get("loop").and_then(Value::as_bool).unwrap_or(false);
+            let entries = arg_clip_entries(args, "entries")?.unwrap_or_default();
+            let data = send(
+                &session.socket,
+                Cmd::SpriteClipCreate { workspace, sprite, name, loop_, entries },
+                CALL_TIMEOUT,
+                connect,
+            )?;
+            Ok(vec![json!({ "type": "text", "text": data.to_string() })])
+        }
+        "sprite_clip_update" => {
+            let sprite = arg_str(args, "sprite").ok_or("missing required argument: sprite")?;
+            let clip = arg_clip_ref(args, "clip")?;
+            let name = arg_str(args, "name");
+            let loop_ = args.get("loop").and_then(Value::as_bool);
+            let entries = arg_clip_entries(args, "entries")?;
+            let data = send(
+                &session.socket,
+                Cmd::SpriteClipUpdate { workspace, sprite, clip, name, loop_, entries },
+                CALL_TIMEOUT,
+                connect,
+            )?;
+            Ok(vec![json!({ "type": "text", "text": data.to_string() })])
+        }
+        "sprite_clip_delete" => {
+            let sprite = arg_str(args, "sprite").ok_or("missing required argument: sprite")?;
+            let clip = arg_clip_ref(args, "clip")?;
+            let data = send(
+                &session.socket,
+                Cmd::SpriteClipDelete { workspace, sprite, clip },
+                CALL_TIMEOUT,
+                connect,
+            )?;
+            Ok(vec![json!({ "type": "text", "text": data.to_string() })])
+        }
+        "sprite_save" => {
+            let sprite = arg_str(args, "sprite").ok_or("missing required argument: sprite")?;
+            let data =
+                send(&session.socket, Cmd::SpriteSave { workspace, sprite }, CALL_TIMEOUT, connect)?;
+            Ok(vec![json!({ "type": "text", "text": data.to_string() })])
+        }
+        "sprite_reference_sheet" => {
+            let sprite = arg_str(args, "sprite").ok_or("missing required argument: sprite")?;
+            let path = arg_str(args, "path");
+            let mut data = send(
+                &session.socket,
+                Cmd::SpriteReferenceSheet { workspace, sprite, path: path.clone() },
+                CALL_TIMEOUT,
+                connect,
+            )?;
+            let write_to = data.as_object_mut().and_then(|o| o.remove("write_to"));
+            let image = image_content(&data)?;
+            let meta_object = data.as_object_mut().expect("SpriteReferenceSheet replies with an object");
+            meta_object.remove("width");
+            meta_object.remove("height");
+            meta_object.remove("bgra_base64");
+            if let (Some(path), Some(write_to)) = (&path, write_to.as_ref().and_then(Value::as_str)) {
+                write_image_to_disk(&image, write_to)?;
+                meta_object.insert("written".to_string(), json!(path));
+            }
+            Ok(vec![json!({ "type": "text", "text": data.to_string() }), image])
+        }
+        "sprite_tileset_image" => {
+            let sprite = arg_str(args, "sprite").ok_or("missing required argument: sprite")?;
+            let path = arg_str(args, "path");
+            let mut data = send(
+                &session.socket,
+                Cmd::SpriteTilesetImage { workspace, sprite, path: path.clone() },
+                CALL_TIMEOUT,
+                connect,
+            )?;
+            let write_to = data.as_object_mut().and_then(|o| o.remove("write_to"));
+            let image = image_content(&data)?;
+            let mut content = Vec::new();
+            if let (Some(path), Some(write_to)) = (path, write_to.as_ref().and_then(Value::as_str)) {
+                write_image_to_disk(&image, write_to)?;
+                content.push(json!({ "type": "text", "text": json!({ "written": path }).to_string() }));
+            }
+            content.push(image);
+            Ok(content)
         }
         other => Err(format!("unknown tool {other:?}")),
     }
@@ -1193,6 +1411,179 @@ mod tests {
     }
 
     #[test]
+    fn sprite_tools_forward_their_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_session(dir.path(), std::process::id());
+        let connect = |_: &Path, line: &str, _: Duration| -> std::io::Result<String> {
+            if line.contains(r#""cmd":"sprite_list""#) {
+                Ok(r#"{"id":1,"ok":true,"data":{"sprites":[{"stem":"sprites/hero","rel_path":"sprites/hero.spr"}]}}"#.to_string())
+            } else {
+                assert!(
+                    line.contains(r#""cmd":"sprite_read""#)
+                        && line.contains(r#""sprite":"sprites/hero""#),
+                    "{line}"
+                );
+                Ok(r#"{"id":1,"ok":true,"data":{"stem":"sprites/hero","dirty":false,"clips":[]}}"#
+                    .to_string())
+            }
+        };
+        let (content, is_err) =
+            call_tool("sprite_list", &json!({}), dir.path(), &no_daemon(), &connect);
+        assert!(
+            !is_err && content[0]["text"].as_str().unwrap().contains("sprites/hero"),
+            "{content:?}"
+        );
+        let (content, is_err) = call_tool(
+            "sprite_read",
+            &json!({"sprite": "sprites/hero"}),
+            dir.path(),
+            &no_daemon(),
+            &connect,
+        );
+        assert!(
+            !is_err
+                && content[0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(r#""dirty":false"#),
+            "{content:?}"
+        );
+    }
+
+    #[test]
+    fn sprite_clip_create_forwards_entries_and_defaults_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_session(dir.path(), std::process::id());
+        let connect = |_: &Path, line: &str, _: Duration| -> std::io::Result<String> {
+            assert!(
+                line.contains(r#""cmd":"sprite_clip_create""#)
+                    && line.contains(r#""name":"walk""#)
+                    && line.contains(r#""loop":false"#)
+                    && line.contains(r#""frame":1"#)
+                    && line.contains(r#""duration_ms":80"#),
+                "{line}"
+            );
+            Ok(r#"{"id":1,"ok":true,"data":{"index":0,"name":"walk","loop":false,"entries":[]}}"#
+                .to_string())
+        };
+        let (content, is_err) = call_tool(
+            "sprite_clip_create",
+            &json!({
+                "sprite": "sprites/hero",
+                "name": "walk",
+                "entries": [{"frame": 1, "duration_ms": 80}],
+            }),
+            dir.path(),
+            &no_daemon(),
+            &connect,
+        );
+        assert!(!is_err, "{content:?}");
+    }
+
+    #[test]
+    fn sprite_clip_update_accepts_an_index_or_a_name_for_clip() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_session(dir.path(), std::process::id());
+        let connect = |_: &Path, line: &str, _: Duration| -> std::io::Result<String> {
+            assert!(
+                line.contains(r#""cmd":"sprite_clip_update""#) && line.contains(r#""clip":2"#),
+                "{line}"
+            );
+            Ok(r#"{"id":1,"ok":true,"data":{"index":2,"name":"run","loop":false,"entries":[]}}"#
+                .to_string())
+        };
+        let (content, is_err) = call_tool(
+            "sprite_clip_update",
+            &json!({"sprite": "sprites/hero", "clip": 2, "name": "run"}),
+            dir.path(),
+            &no_daemon(),
+            &connect,
+        );
+        assert!(!is_err, "{content:?}");
+
+        let connect_by_name = |_: &Path, line: &str, _: Duration| -> std::io::Result<String> {
+            assert!(
+                line.contains(r#""clip":"walk""#),
+                "a string clip must cross the wire as ClipRef::Name: {line}"
+            );
+            Ok(r#"{"id":1,"ok":true,"data":{"index":0,"name":"walk","loop":true,"entries":[]}}"#
+                .to_string())
+        };
+        let (content, is_err) = call_tool(
+            "sprite_clip_update",
+            &json!({"sprite": "sprites/hero", "clip": "walk", "loop": true}),
+            dir.path(),
+            &no_daemon(),
+            &connect_by_name,
+        );
+        assert!(!is_err, "{content:?}");
+    }
+
+    #[test]
+    fn sprite_clip_delete_requires_a_clip_argument() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_session(dir.path(), std::process::id());
+        let connect = |_: &Path, _: &str, _: Duration| -> std::io::Result<String> {
+            panic!("a missing clip argument must never reach the host")
+        };
+        let (content, is_err) = call_tool(
+            "sprite_clip_delete",
+            &json!({"sprite": "sprites/hero"}),
+            dir.path(),
+            &no_daemon(),
+            &connect,
+        );
+        assert!(is_err, "{content:?}");
+        assert!(content[0]["text"].as_str().unwrap().contains("clip"), "{content:?}");
+    }
+
+    #[test]
+    fn sprite_reference_sheet_splits_the_image_and_writes_when_a_path_is_given() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        fake_session(dir.path(), std::process::id());
+        let bgra = base64::engine::general_purpose::STANDARD.encode([0u8, 0, 255, 255]);
+        let write_target = dir.path().join("sheet.png");
+        let connect = move |_: &Path, line: &str, _: Duration| -> std::io::Result<String> {
+            assert!(line.contains(r#""cmd":"sprite_reference_sheet""#), "{line}");
+            let write_to = if line.contains(r#""path":"sheet.png""#) {
+                format!(r#","write_to":"{}""#, write_target.display())
+            } else {
+                String::new()
+            };
+            Ok(format!(
+                r#"{{"id":1,"ok":true,"data":{{"width":1,"height":1,"bgra_base64":"{bgra}","cols":1,"rows":1,"tiles":[0]{write_to}}}}}"#
+            ))
+        };
+        let (content, is_err) = call_tool(
+            "sprite_reference_sheet",
+            &json!({"sprite": "sprites/hero"}),
+            dir.path(),
+            &no_daemon(),
+            &connect,
+        );
+        assert!(!is_err, "{content:?}");
+        assert_eq!(content.len(), 2, "metadata text, then the image");
+        assert!(content[0]["text"].as_str().unwrap().contains(r#""cols":1"#));
+        assert!(
+            !content[0]["text"].as_str().unwrap().contains("bgra_base64"),
+            "the image bytes moved out of the text block"
+        );
+        assert_eq!(content[1]["type"], "image");
+
+        let (content, is_err) = call_tool(
+            "sprite_reference_sheet",
+            &json!({"sprite": "sprites/hero", "path": "sheet.png"}),
+            dir.path(),
+            &no_daemon(),
+            &connect,
+        );
+        assert!(!is_err, "{content:?}");
+        assert!(content[0]["text"].as_str().unwrap().contains(r#""written":"sheet.png""#));
+        assert!(dir.path().join("sheet.png").exists(), "the PNG landed on disk");
+    }
+
+    #[test]
     fn tool_list_names_exactly_the_agent_surface() {
         let list = tool_list();
         let names: Vec<&str> =
@@ -1224,8 +1615,56 @@ mod tests {
                 "world_open",
                 "world_read",
                 "world_screenshot",
+                "sprite_list",
+                "sprite_read",
+                "sprite_clip_create",
+                "sprite_clip_update",
+                "sprite_clip_delete",
+                "sprite_save",
+                "sprite_reference_sheet",
+                "sprite_tileset_image",
             ]
         );
+    }
+
+    /// The reference sheet is the whole point of the tool: an agent that
+    /// never reads this description could easily reach for the pool's
+    /// scrambled tile order instead when it goes to build a clip.
+    #[test]
+    fn sprite_reference_sheet_description_mentions_clips() {
+        let list = tool_list();
+        let sheet = list["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "sprite_reference_sheet")
+            .expect("sprite_reference_sheet is listed");
+        assert!(
+            sheet["description"].as_str().unwrap().contains("clip"),
+            "{:?}",
+            sheet["description"]
+        );
+    }
+
+    /// Every clip-editing tool leaves the document dirty on purpose (so a
+    /// batch of edits folds into one save); an agent that never reads
+    /// this would edit clips and never call sprite_save.
+    #[test]
+    fn clip_tool_descriptions_mention_sprite_save() {
+        let list = tool_list();
+        for name in ["sprite_clip_create", "sprite_clip_update", "sprite_clip_delete"] {
+            let tool = list["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is listed"));
+            assert!(
+                tool["description"].as_str().unwrap().contains("sprite_save"),
+                "{name}: {:?}",
+                tool["description"]
+            );
+        }
     }
 
     /// The user directive behind the tool: an agent must not occupy the
