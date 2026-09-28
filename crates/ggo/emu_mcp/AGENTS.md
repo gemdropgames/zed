@@ -60,6 +60,14 @@ candidate is live. Start with `zed_sessions` when unsure.
 | `world_open { world }` | open a world in the World panel |
 | `world_read { world? }` | the authored world: entities/components/pos, instances, backgrounds, selection, dirty |
 | `world_screenshot { world?, full? }` | the authored world as PNG: device screen at the camera, or the whole scene |
+| `sprite_list` | every `.spr` in the project: `{ sprites: [{ stem, rel_path }] }` |
+| `sprite_read { sprite? }` | the authored sprite: bound tileset, frame footprint, clips |
+| `sprite_clip_create { sprite, name, loop?, entries? }` | append a clip; UNSAVED until `sprite_save` |
+| `sprite_clip_update { sprite, clip, name?, loop?, entries? }` | merge fields into a clip (`clip` is an index or a unique name); UNSAVED until `sprite_save` |
+| `sprite_clip_delete { sprite, clip }` | delete a clip; UNSAVED until `sprite_save` |
+| `sprite_save { sprite }` | persist the open sprite's unsaved edits: `{ saved: rel_path }` |
+| `sprite_reference_sheet { sprite, path? }` | the bound tileset's source-art layout as PNG + `{ cols, rows, tiles }`; `path` also writes it to disk |
+| `sprite_tileset_image { sprite, path? }` | the bound tileset's whole pool as a PNG grid; `path` also writes it to disk |
 
 ## Worlds
 
@@ -78,6 +86,38 @@ framed on the world's active camera (the engine's own centring rule), or
 the whole scene's bounding box with `full`. Sprites, tilemaps and
 backgrounds composite as real pixels; text and placeholder entities are
 flat boxes, and the editor's selection outline is left out.
+
+## Sprites
+
+`sprite_list` / `sprite_read` / the three clip tools / `sprite_save` /
+`sprite_reference_sheet` / `sprite_tileset_image` read and edit the
+SPRITE panel's documents — clip animations over a shared tile pool, not
+the running game. Every tool that names a `sprite` opens (or focuses) its
+editor tab the same way `world_open` does: a sprite that already has a
+tab is brought to the front rather than reloaded, so unsaved edits, undo
+history and playback survive, and opening one sprite never disturbs
+another.
+
+**Look at the reference sheet before you touch clips.** `.spr` documents
+store their tiles in a POOL, not in drawing order — the pool is
+deduplicated and reordered at import time, so pool index order tells you
+nothing about which tile is which pose or frame. `sprite_reference_sheet`
+is the source artwork laid out exactly as it was drawn (poses, facing,
+sequence order): read it first, work out which `entries[].frame` values
+you want, THEN call the clip tools. `sprite_tileset_image` is the raw
+pool instead — reach for it only when you actually need pool-index order
+(e.g. lining up `sprite_read`'s `entries[].frame` against real pixels),
+not as a substitute for the reference sheet.
+
+**Clip edits are unsaved until you say so.** `sprite_clip_create` /
+`sprite_clip_update` / `sprite_clip_delete` apply immediately (undoable
+in the editor, visible in the panel) but leave the document DIRTY on
+purpose, so several edits fold into one save. Call `sprite_save` once
+you're done with a batch, not after every single clip op — check
+`sprite_read`'s `dirty` field if you're unsure whether anything is
+still unsaved. `sprite_clip_update`/`sprite_clip_delete`'s `clip`
+argument is an index or a clip's (unique) name; a name shared by more
+than one clip is refused and asks for an index instead of guessing.
 
 ## Hardware
 
