@@ -1545,18 +1545,31 @@ struct Shown {
 
 /// The offset of nothing: a thumbnail's image is drawn unshifted.
 const NO_OFFSET: (i16, i16) = (0, 0);
+const NO_FLIP: (bool, bool) = (false, false);
 
 impl OpenSprite {
     /// The device's placement of `frame`'s tiles: the frame's offset
-    /// plus the clip entry's, wrapping like the ABI's i16 math.
-    fn placed_offset(&self, frame: usize, entry: (i16, i16)) -> (i16, i16) {
+    /// (mirrored per axis by the entry's flip) plus the clip entry's,
+    /// wrapping like the ABI's i16 math.
+    fn placed_offset(
+        &self,
+        frame: usize,
+        entry: (i16, i16),
+        flip: (bool, bool),
+    ) -> (i16, i16) {
         let base = self
             .store
             .state()
             .frames
             .get(frame)
             .map_or(NO_OFFSET, |f| f.offset);
-        (base.0.wrapping_add(entry.0), base.1.wrapping_add(entry.1))
+        // Flip mirrors the frame's offset about the footprint centre; the
+        // entry's own offset is never mirrored.
+        let mirror = |v: i16, flipped: bool| if flipped { v.wrapping_neg() } else { v };
+        (
+            mirror(base.0, flip.0).wrapping_add(entry.0),
+            mirror(base.1, flip.1).wrapping_add(entry.1),
+        )
     }
 
     fn new(
@@ -1617,13 +1630,17 @@ impl OpenSprite {
                 frame: entry.frame,
                 transform: entry.transform,
                 flip: (entry.flip_h, entry.flip_v),
-                offset: self.placed_offset(entry.frame, entry.offset),
+                offset: self.placed_offset(
+                    entry.frame,
+                    entry.offset,
+                    (entry.flip_h, entry.flip_v),
+                ),
             },
             None => Shown {
                 frame: position,
                 transform: FrameTransform::IDENTITY,
                 flip: (false, false),
-                offset: self.placed_offset(position, NO_OFFSET),
+                offset: self.placed_offset(position, NO_OFFSET, NO_FLIP),
             },
         }
     }
@@ -1644,14 +1661,18 @@ impl OpenSprite {
                 frame: entry.frame,
                 transform: entry.transform,
                 flip: (entry.flip_h, entry.flip_v),
-                offset: self.placed_offset(entry.frame, entry.offset),
+                offset: self.placed_offset(
+                    entry.frame,
+                    entry.offset,
+                    (entry.flip_h, entry.flip_v),
+                ),
             };
         }
         Shown {
             frame: self.selected_frame,
             transform: FrameTransform::IDENTITY,
             flip: (false, false),
-            offset: self.placed_offset(self.selected_frame, NO_OFFSET),
+            offset: self.placed_offset(self.selected_frame, NO_OFFSET, NO_FLIP),
         }
     }
 
@@ -11951,6 +11972,21 @@ mod tests {
 
     /// `shown()` carries frame + entry offset so the preview draws where
     /// the device will.
+    #[gpui::test]
+    async fn test_shown_offset_mirrors_frame_offset_under_entry_flip(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.select_entry(0, 1, cx);
+            let frame = ready(panel).selected_frame;
+            panel.apply_doc(DocOp::FrameOffsetSet { frame, offset: (2, 3) }, cx);
+            panel.commit_edit(EditTarget::OffsetX, "10".into(), cx);
+            panel.set_entry_flip(0, 1, true, false, cx);
+            // dx mirrors (-2 + 10); dy and the entry offset do not.
+            assert_eq!(ready(panel).shown().offset, (8, 3));
+        });
+    }
+
     #[gpui::test]
     async fn test_shown_offset_sums_frame_and_entry(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
