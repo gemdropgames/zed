@@ -100,7 +100,10 @@ impl SpriteEditorItem {
         self.panel.clone()
     }
 
-    pub(crate) fn panel(&self) -> &Entity<SpritePanel> {
+    /// The tab's inner document panel -- the MCP host's sprite_* tools
+    /// reach `SpritePanel::remote_*` through this the same way
+    /// `world_panel_for`/`world_panel_open` reach `WorldPanel`'s.
+    pub fn panel(&self) -> &Entity<SpritePanel> {
         &self.panel
     }
 }

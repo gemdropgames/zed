@@ -182,6 +182,12 @@ const TICK: Duration = Duration::from_millis(16);
 /// shape never depends on what a human last dragged it to.
 const TILESET_IMAGE_COLS: usize = 16;
 
+/// What a `remote_*` read/op against a `Loading` sprite reports --
+/// `ggo_emu_panel::agent_remote`'s poll loop (`await_sprite_ready`,
+/// mirroring `ggo_world_panel::WORLD_STILL_LOADING`) watches for this
+/// substring to tell "keep waiting" from a real failure.
+pub const SPRITE_STILL_LOADING: &str = "still loading";
+
 /// A clip named either by its index or by its (unique) name -- accepted
 /// by [`SpritePanel::remote_clip_update`]/[`SpritePanel::remote_clip_delete`].
 /// Kept independent of `ggo_emu_remote`'s wire `ClipRef` DTO (this crate
@@ -2776,12 +2782,25 @@ impl SpritePanel {
             })
     }
 
+    /// `Err` while nothing is open, a load is still in flight (the
+    /// message names [`SPRITE_STILL_LOADING`], which
+    /// `ggo_emu_panel::agent_remote`'s poll loop watches for), or the
+    /// last load failed.
+    fn require_open(&self) -> Result<&OpenSprite, String> {
+        match &self.state {
+            ViewerState::Ready(open) => Ok(open),
+            ViewerState::Empty => Err("no sprite open — sprite_open first".to_string()),
+            ViewerState::Loading { rel_path } => {
+                Err(format!("{rel_path} is {SPRITE_STILL_LOADING}"))
+            }
+            ViewerState::Error(error) => Err(format!("the open sprite failed to load: {error}")),
+        }
+    }
+
     /// The open sprite as authored: bound tileset, frame footprint,
     /// clips -- `sprite_read`'s shape.
     pub fn remote_read(&self) -> Result<serde_json::Value, String> {
-        let ViewerState::Ready(open) = &self.state else {
-            return Err("no sprite open — sprite_open first".to_string());
-        };
+        let open = self.require_open()?;
         let state = open.store.state();
         let stem = |rel: &str| Path::new(rel).with_extension("").to_string_lossy().replace('\\', "/");
         let clips: Vec<serde_json::Value> = state
@@ -2818,7 +2837,7 @@ impl SpritePanel {
             ViewerState::Ready(open) => {
                 Err(open.op_error.clone().unwrap_or_else(|| "doc op rejected".to_string()))
             }
-            _ => Err("no sprite open — sprite_open first".to_string()),
+            _ => self.require_open().map(|_| ()),
         }
     }
 
@@ -2832,9 +2851,7 @@ impl SpritePanel {
         entries: Vec<ClipEntry>,
         cx: &mut Context<Self>,
     ) -> Result<serde_json::Value, String> {
-        if !matches!(self.state, ViewerState::Ready(_)) {
-            return Err("no sprite open — sprite_open first".to_string());
-        }
+        self.require_open()?;
         self.apply_doc_checked(DocOp::ClipAdd { clip: ClipEdit { name, loop_, entries } }, cx)?;
         let ViewerState::Ready(open) = &self.state else {
             unreachable!("checked Ready above and apply_doc_checked never leaves it");
@@ -2848,9 +2865,7 @@ impl SpritePanel {
     /// clip (ambiguous -- the caller is asked for an index instead), is
     /// an error.
     fn resolve_clip(&self, clip: &ClipLookup) -> Result<usize, String> {
-        let ViewerState::Ready(open) = &self.state else {
-            return Err("no sprite open — sprite_open first".to_string());
-        };
+        let open = self.require_open()?;
         let clips = &open.store.state().clips;
         match clip {
             ClipLookup::Index(i) => {
@@ -2892,9 +2907,7 @@ impl SpritePanel {
         cx: &mut Context<Self>,
     ) -> Result<serde_json::Value, String> {
         let at = self.resolve_clip(&clip)?;
-        let ViewerState::Ready(open) = &self.state else {
-            return Err("no sprite open — sprite_open first".to_string());
-        };
+        let open = self.require_open()?;
         let current = open.store.state().clips[at].clone();
         let merged = ClipEdit {
             name: name.unwrap_or(current.name),
@@ -2919,9 +2932,7 @@ impl SpritePanel {
         cx: &mut Context<Self>,
     ) -> Result<serde_json::Value, String> {
         let at = self.resolve_clip(&clip)?;
-        let ViewerState::Ready(open) = &self.state else {
-            return Err("no sprite open — sprite_open first".to_string());
-        };
+        let open = self.require_open()?;
         let name = open.store.state().clips[at].name.clone();
         let next_active = edits::active_clip_after_clip_delete(open.active_clip, at);
         self.apply_doc_checked(DocOp::ClipSet { at, clip: None }, cx)?;
@@ -2934,13 +2945,9 @@ impl SpritePanel {
     /// `sprite_save`: the same fold-back save the editor's own Save
     /// button uses, reporting the rel it wrote or the reason it did not.
     pub fn remote_save(&mut self, cx: &mut Context<Self>) -> Result<String, String> {
-        if !matches!(self.state, ViewerState::Ready(_)) {
-            return Err("no sprite open — sprite_open first".to_string());
-        }
+        self.require_open()?;
         self.save_impl(cx);
-        let ViewerState::Ready(open) = &self.state else {
-            return Err("no sprite open — sprite_open first".to_string());
-        };
+        let open = self.require_open()?;
         match &open.save_error {
             Some(e) => Err(e.clone()),
             None => Ok(open.source_rel.clone()),
@@ -2955,9 +2962,7 @@ impl SpritePanel {
     pub fn remote_reference_sheet(
         &self,
     ) -> Result<(u32, u32, Vec<u8>, reference_sheet::ReferenceSheet), String> {
-        let ViewerState::Ready(open) = &self.state else {
-            return Err("no sprite open — sprite_open first".to_string());
-        };
+        let open = self.require_open()?;
         let sheet = open
             .reference
             .clone()
@@ -2973,9 +2978,7 @@ impl SpritePanel {
     /// BGRA image, every pool tile (blanks included) in pool-index order,
     /// [`TILESET_IMAGE_COLS`] tiles wide.
     pub fn remote_tileset_image(&self) -> Result<(u32, u32, Vec<u8>), String> {
-        let ViewerState::Ready(open) = &self.state else {
-            return Err("no sprite open — sprite_open first".to_string());
-        };
+        let open = self.require_open()?;
         let state = open.store.state();
         let (mut rgba, width, height) = loader::compose_pool_image(state, TILESET_IMAGE_COLS)
             .ok_or_else(|| "the sprite's tileset pool is empty".to_string())?;
@@ -11760,6 +11763,34 @@ mod tests {
     }
 
     // ------------------------------------------------------ agent socket
+
+    /// A read against a tab still loading off-thread reports
+    /// [`SPRITE_STILL_LOADING`] (in the message, alongside the rel) --
+    /// what `ggo_emu_panel::agent_remote`'s poll loop watches for to tell
+    /// "ask again" from a real failure.
+    #[gpui::test]
+    async fn test_remote_read_reports_still_loading_before_the_off_thread_load_lands(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        write_sprite_fixture(dir.path());
+        let root = dir.path().to_path_buf();
+        let panel = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut panel = SpritePanel::new(None, cx);
+                panel.root_override = Some(root);
+                panel
+            })
+        });
+        panel.update(cx, |panel, cx| {
+            panel.refresh_root(cx);
+            panel.load_rel_path("sprites/hero.spr", cx);
+        });
+        let err = panel.read_with(cx, |panel, _| panel.remote_read()).unwrap_err();
+        assert!(err.contains("sprites/hero.spr"), "{err}");
+        assert!(err.contains(SPRITE_STILL_LOADING), "{err}");
+        cx.executor().run_until_parked();
+    }
 
     #[gpui::test]
     async fn test_remote_list_and_resolve_the_projects_sprites(cx: &mut TestAppContext) {
