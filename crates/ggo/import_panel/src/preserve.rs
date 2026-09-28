@@ -71,8 +71,8 @@ pub(crate) fn check(old: &SpriteState, new: &SpriteState) -> Result<(), Mismatch
 /// WHOLE, each entry keeping the frame it points at (matched by position
 /// -- frame `i` is still frame `i`) along with the duration, flip, offset
 /// and transform it plays at, and each frame keeps its pixel offset.
-/// Frames the old document never had are
-/// simply not referenced by any clip.
+/// Frames the old document never had are simply not referenced by any
+/// clip.
 ///
 /// Only meaningful after [`check`] has passed, but written not to depend
 /// on it: a clip with ANY entry past `new`'s frame list is DROPPED rather

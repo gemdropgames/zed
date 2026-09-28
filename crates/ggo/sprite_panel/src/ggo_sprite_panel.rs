@@ -4564,13 +4564,14 @@ impl SpritePanel {
                 state.h_tiles as u32 * ggo_worldlib::sprites::hw::TILE_PX as u32,
                 PREVIEW_PX,
             );
-            // Device pixels -> preview pixels: the fit scales the frame's
-            // footprint to `fit_w`. The overlay records its bounds after
+            // Device pixels -> preview pixels at the IMAGE's texel scale
+            // (`w` texels shown `fit_w` wide; a transformed entry's
+            // canvas is doubled, so the footprint would over-shift). The overlay records its bounds after
             // this shift, so `preview_cell_at` still maps clicks right.
             let (shift_x, shift_y) = playback::preview_offset_shift(
                 open.shown().offset,
                 fit_w,
-                state.w_tiles as u32 * ggo_worldlib::sprites::hw::TILE_PX as u32,
+                w,
             );
             let bounds_cell = open.preview_bounds.clone();
             let state = open.store.state();

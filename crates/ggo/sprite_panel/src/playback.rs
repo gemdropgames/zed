@@ -76,14 +76,14 @@ pub fn preview_display_size(
 }
 
 /// The preview shift, in preview pixels, for a device-pixel `offset`:
-/// the frame's footprint (`frame_w` device pixels) is fitted to `fit_w`
-/// preview pixels, so the offset scales by the same ratio. UI layout
-/// only -- the offset itself stays integer.
-pub fn preview_offset_shift(offset: (i16, i16), fit_w: f32, frame_w: u32) -> (f32, f32) {
-    if frame_w == 0 {
+/// the IMAGE (`image_w` texels, the doubled canvas for a transformed
+/// entry) displays `fit_w` preview pixels wide, so the offset scales by
+/// that texel scale. UI layout only -- the offset itself stays integer.
+pub fn preview_offset_shift(offset: (i16, i16), fit_w: f32, image_w: u32) -> (f32, f32) {
+    if image_w == 0 {
         return (0., 0.);
     }
-    let scale = fit_w / frame_w as f32;
+    let scale = fit_w / image_w as f32;
     (f32::from(offset.0) * scale, f32::from(offset.1) * scale)
 }
 
@@ -228,7 +228,10 @@ mod tests {
         // A 16 px footprint fitted to 160 px: one device pixel is 10.
         assert_eq!(preview_offset_shift((2, -1), 160., 16), (20., -10.));
         assert_eq!(preview_offset_shift((0, 0), 160., 16), (0., 0.));
-        assert_eq!(preview_offset_shift((3, 3), 160., 0), (0., 0.), "empty footprint");
+        assert_eq!(preview_offset_shift((3, 3), 160., 0), (0., 0.), "empty image");
+        // A doubled (transformed) canvas: 32 texels shown 320 wide is
+        // still 10 preview px per texel, not the footprint's 20.
+        assert_eq!(preview_offset_shift((2, -1), 320., 32), (20., -10.));
     }
 
     #[test]
