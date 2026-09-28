@@ -75,6 +75,18 @@ pub fn preview_display_size(
     )
 }
 
+/// The preview shift, in preview pixels, for a device-pixel `offset`:
+/// the frame's footprint (`frame_w` device pixels) is fitted to `fit_w`
+/// preview pixels, so the offset scales by the same ratio. UI layout
+/// only -- the offset itself stays integer.
+pub fn preview_offset_shift(offset: (i16, i16), fit_w: f32, frame_w: u32) -> (f32, f32) {
+    if frame_w == 0 {
+        return (0., 0.);
+    }
+    let scale = fit_w / frame_w as f32;
+    (f32::from(offset.0) * scale, f32::from(offset.1) * scale)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,6 +221,14 @@ mod tests {
         assert_eq!(fit_size(32, 16, 48.0), (48.0, 24.0)); // wide
         assert_eq!(fit_size(16, 64, 32.0), (8.0, 32.0)); // tall
         assert_eq!(fit_size(0, 16, 48.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn preview_offset_shift_scales_device_pixels_to_the_fit() {
+        // A 16 px footprint fitted to 160 px: one device pixel is 10.
+        assert_eq!(preview_offset_shift((2, -1), 160., 16), (20., -10.));
+        assert_eq!(preview_offset_shift((0, 0), 160., 16), (0., 0.));
+        assert_eq!(preview_offset_shift((3, 3), 160., 0), (0., 0.), "empty footprint");
     }
 
     #[test]

@@ -1538,9 +1538,27 @@ struct Shown {
     frame: usize,
     transform: FrameTransform,
     flip: (bool, bool),
+    /// The frame's pixel offset plus the entry's own, as the device
+    /// applies them; `(0, 0)` for a thumbnail, whose image ignores it.
+    offset: (i16, i16),
 }
 
+/// The offset of nothing: a thumbnail's image is drawn unshifted.
+const NO_OFFSET: (i16, i16) = (0, 0);
+
 impl OpenSprite {
+    /// The device's placement of `frame`'s tiles: the frame's offset
+    /// plus the clip entry's, wrapping like the ABI's i16 math.
+    fn placed_offset(&self, frame: usize, entry: (i16, i16)) -> (i16, i16) {
+        let base = self
+            .store
+            .state()
+            .frames
+            .get(frame)
+            .map_or(NO_OFFSET, |f| f.offset);
+        (base.0.wrapping_add(entry.0), base.1.wrapping_add(entry.1))
+    }
+
     fn new(
         rel_path: String,
         source_rel: String,
@@ -1599,11 +1617,13 @@ impl OpenSprite {
                 frame: entry.frame,
                 transform: entry.transform,
                 flip: (entry.flip_h, entry.flip_v),
+                offset: self.placed_offset(entry.frame, entry.offset),
             },
             None => Shown {
                 frame: position,
                 transform: FrameTransform::IDENTITY,
                 flip: (false, false),
+                offset: self.placed_offset(position, NO_OFFSET),
             },
         }
     }
@@ -1624,12 +1644,14 @@ impl OpenSprite {
                 frame: entry.frame,
                 transform: entry.transform,
                 flip: (entry.flip_h, entry.flip_v),
+                offset: self.placed_offset(entry.frame, entry.offset),
             };
         }
         Shown {
             frame: self.selected_frame,
             transform: FrameTransform::IDENTITY,
             flip: (false, false),
+            offset: self.placed_offset(self.selected_frame, NO_OFFSET),
         }
     }
 
@@ -2819,6 +2841,7 @@ impl SpritePanel {
             "dirty": open.store.dirty(),
             "tileset": { "stem": stem(&open.til_path), "rel_path": open.til_path },
             "frame_count": state.frames.len(),
+            "frame_offsets": state.frames.iter().map(|f| [f.offset.0, f.offset.1]).collect::<Vec<_>>(),
             "frame_size": {
                 "tiles": [state.w_tiles, state.h_tiles],
                 "pixels": [
@@ -4541,6 +4564,14 @@ impl SpritePanel {
                 state.h_tiles as u32 * ggo_worldlib::sprites::hw::TILE_PX as u32,
                 PREVIEW_PX,
             );
+            // Device pixels -> preview pixels: the fit scales the frame's
+            // footprint to `fit_w`. The overlay records its bounds after
+            // this shift, so `preview_cell_at` still maps clicks right.
+            let (shift_x, shift_y) = playback::preview_offset_shift(
+                open.shown().offset,
+                fit_w,
+                state.w_tiles as u32 * ggo_worldlib::sprites::hw::TILE_PX as u32,
+            );
             let bounds_cell = open.preview_bounds.clone();
             let state = open.store.state();
             let (grid_cols, grid_rows) = (state.w_tiles as usize, state.h_tiles as usize);
@@ -4574,6 +4605,8 @@ impl SpritePanel {
                     // corner instead of being centred out of scroll range
                     // (the range only ever runs `-overflow ..= 0`).
                     .m_auto()
+                    .left(px(shift_x))
+                    .top(px(shift_y))
                     .w(px(fit_w))
                     .h(px(fit_h))
                     .child(img(image).nearest(true).w(px(fit_w)).h(px(fit_h)))
@@ -5208,6 +5241,7 @@ impl SpritePanel {
                     frame: entry.frame,
                     transform: entry.transform,
                     flip: (entry.flip_h, entry.flip_v),
+                    offset: NO_OFFSET,
                 })
                 .map(|image| {
                     let (w, h) = image_px_size(&image);
@@ -8589,6 +8623,7 @@ mod tests {
                 frame: rotated.frame,
                 transform: rotated.transform,
                 flip: (rotated.flip_h, rotated.flip_v),
+                offset: NO_OFFSET,
             };
             let transformed = open.frame_image_for(shown).expect("composes");
             let (w, h) = image_px_size(&transformed);
@@ -8606,6 +8641,7 @@ mod tests {
                     frame: plain.frame,
                     transform: plain.transform,
                     flip: (plain.flip_h, plain.flip_v),
+                    offset: NO_OFFSET,
                 })
                 .expect("identity entry");
             assert!(
@@ -11910,6 +11946,32 @@ mod tests {
                 .unwrap_err()
                 .contains("sprites/hero")
         );
+    }
+
+    /// `shown()` carries frame + entry offset so the preview draws where
+    /// the device will.
+    #[gpui::test]
+    async fn test_shown_offset_sums_frame_and_entry(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.select_entry(0, 1, cx);
+            let frame = ready(panel).selected_frame;
+            panel.apply_doc(DocOp::FrameOffsetSet { frame, offset: (2, 3) }, cx);
+            panel.commit_edit(EditTarget::OffsetX, "10".into(), cx);
+            assert_eq!(ready(panel).shown().offset, (12, 3));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_remote_read_lists_frame_offsets(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.apply_doc(DocOp::FrameOffsetSet { frame: 1, offset: (4, -1) }, cx);
+        });
+        let read = panel.read_with(cx, |panel, _| panel.remote_read()).unwrap();
+        assert_eq!(read["frame_offsets"], serde_json::json!([[0, 0], [4, -1]]));
     }
 
     #[gpui::test]
