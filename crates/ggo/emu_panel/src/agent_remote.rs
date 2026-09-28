@@ -1435,7 +1435,7 @@ mod tests {
             tile_count: 2,
             session_tiles: std::collections::HashSet::new(),
             palette,
-            frames: vec![Frame { map: vec![0] }, Frame { map: vec![1] }],
+            frames: vec![Frame { offset: (0, 0), map: vec![0] }, Frame { offset: (0, 0), map: vec![1] }],
             clips: vec![],
             w_tiles: 1,
             h_tiles: 1,

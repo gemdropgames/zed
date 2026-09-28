@@ -1381,6 +1381,10 @@ enum EditTarget {
     ShearY,
     OffsetX,
     OffsetY,
+    /// The selected FRAME's pixel offset (`.spr` v7) -- shared by every
+    /// clip entry that shows the frame, unlike `OffsetX/Y`.
+    FrameOffsetX,
+    FrameOffsetY,
 }
 
 /// One panel text input: the target it edits and the single-line editor
@@ -4010,6 +4014,27 @@ impl SpritePanel {
                     cx,
                 );
             }
+            EditTarget::FrameOffsetX | EditTarget::FrameOffsetY => {
+                let frame = open.selected_frame;
+                let Some(current) = open.store.state().frames.get(frame).map(|f| f.offset) else {
+                    cx.notify();
+                    return;
+                };
+                let Ok(v) = text.trim().parse::<i16>() else {
+                    cx.notify(); // dropped -- editor re-syncs
+                    return;
+                };
+                let offset = if target == EditTarget::FrameOffsetX {
+                    (v, current.1)
+                } else {
+                    (current.0, v)
+                };
+                if offset == current {
+                    cx.notify();
+                    return;
+                }
+                self.apply_doc(DocOp::FrameOffsetSet { frame, offset }, cx);
+            }
             EditTarget::Duration
             | EditTarget::Rot
             | EditTarget::ScaleX
@@ -4098,12 +4123,26 @@ impl SpritePanel {
         target: &EditTarget,
         state: &SpriteState,
         selected_entry: Option<(usize, usize)>,
+        selected_frame: usize,
     ) -> String {
         if let EditTarget::ClipName(i) = target {
             return state
                 .clips
                 .get(*i)
                 .map_or_else(String::new, |c| c.name.clone());
+        }
+        if matches!(target, EditTarget::FrameOffsetX | EditTarget::FrameOffsetY) {
+            return state
+                .frames
+                .get(selected_frame)
+                .map_or_else(String::new, |f| {
+                    if *target == EditTarget::FrameOffsetX {
+                        f.offset.0
+                    } else {
+                        f.offset.1
+                    }
+                    .to_string()
+                });
         }
         // Every other field edits the selected ENTRY; with none selected
         // the inputs read blank rather than showing a stale value.
@@ -4121,7 +4160,9 @@ impl SpritePanel {
             EditTarget::ShearY => edits::format_fixed88(entry.transform.shear_y),
             EditTarget::OffsetX => entry.offset.0.to_string(),
             EditTarget::OffsetY => entry.offset.1.to_string(),
-            EditTarget::ClipName(_) => String::new(),
+            EditTarget::ClipName(_)
+            | EditTarget::FrameOffsetX
+            | EditTarget::FrameOffsetY => String::new(),
         }
     }
 
@@ -4147,6 +4188,8 @@ impl SpritePanel {
         targets.push(EditTarget::ShearY);
         targets.push(EditTarget::OffsetX);
         targets.push(EditTarget::OffsetY);
+        targets.push(EditTarget::FrameOffsetX);
+        targets.push(EditTarget::FrameOffsetY);
 
         let same_targets = open.editors.len() == targets.len()
             && open
@@ -4161,7 +4204,12 @@ impl SpritePanel {
                 if entry.editor.focus_handle(cx).is_focused(window) {
                     continue;
                 }
-                let text = Self::edit_display_text(&entry.target, state, open.selected_entry);
+                let text = Self::edit_display_text(
+                    &entry.target,
+                    state,
+                    open.selected_entry,
+                    open.selected_frame,
+                );
                 if entry.editor.read(cx).text(cx) != text {
                     entry
                         .editor
@@ -4173,7 +4221,12 @@ impl SpritePanel {
 
         let mut entries = Vec::with_capacity(targets.len());
         for target in targets {
-            let text = Self::edit_display_text(&target, open.store.state(), open.selected_entry);
+            let text = Self::edit_display_text(
+                &target,
+                open.store.state(),
+                open.selected_entry,
+                open.selected_frame,
+            );
             let editor = cx.new(|cx| {
                 let mut editor = Editor::single_line(window, cx);
                 editor.set_text(text, window, cx);
@@ -5554,6 +5607,16 @@ impl SpritePanel {
             .child(labelled("dx", 48., EditTarget::OffsetX))
             .child(labelled("dy", 48., EditTarget::OffsetY))
             .child(
+                Label::new(format!(
+                    "Frame {} offset (all clips)",
+                    open.selected_frame + 1
+                ))
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+            )
+            .child(labelled("fdx", 48., EditTarget::FrameOffsetX))
+            .child(labelled("fdy", 48., EditTarget::FrameOffsetY))
+            .child(
                 h_flex()
                     .gap_2()
                     .child(
@@ -5864,7 +5927,7 @@ pub(crate) mod test_fixtures {
             tile_count: 3,
             session_tiles: std::collections::HashSet::new(),
             palette,
-            frames: vec![Frame { map: vec![0] }],
+            frames: vec![Frame { offset: (0, 0), map: vec![0] }],
             clips: vec![],
             w_tiles: 1,
             h_tiles: 1,
@@ -5897,7 +5960,7 @@ pub(crate) mod test_fixtures {
             tile_count: 2,
             session_tiles: std::collections::HashSet::new(),
             palette,
-            frames: vec![Frame { map: vec![0] }, Frame { map: vec![1] }],
+            frames: vec![Frame { offset: (0, 0), map: vec![0] }, Frame { offset: (0, 0), map: vec![1] }],
             clips: vec![ClipEdit {
                 name: "walk".to_string(),
                 loop_: false,
@@ -6644,7 +6707,8 @@ mod tests {
                 SpritePanel::edit_display_text(
                     &EditTarget::Rot,
                     ready(panel).store.state(),
-                    Some((0, 0))
+                    Some((0, 0)),
+                    ready(panel).selected_frame
                 ),
                 "90"
             );
@@ -6652,7 +6716,8 @@ mod tests {
                 SpritePanel::edit_display_text(
                     &EditTarget::ScaleX,
                     ready(panel).store.state(),
-                    Some((0, 0))
+                    Some((0, 0)),
+                    ready(panel).selected_frame
                 ),
                 "2.50"
             );
@@ -8420,6 +8485,36 @@ mod tests {
             assert_eq!(entry.offset, (4, -6));
             assert_eq!((entry.flip_h, entry.flip_v), (true, false));
             assert_eq!(ready(panel).store.state().frames.len(), 2);
+        });
+    }
+
+    /// The frame offset fields edit the SELECTED FRAME (every clip that
+    /// shows it), not the selected entry, in one undo step each; junk
+    /// input is dropped.
+    #[gpui::test]
+    async fn test_frame_offset_fields_edit_the_selected_frame(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.select_entry(0, 1, cx);
+            let frame = ready(panel).selected_frame;
+            let entry_before = ready(panel).store.state().clips[0].entries[1];
+            panel.commit_edit(EditTarget::FrameOffsetX, "-3".into(), cx);
+            panel.commit_edit(EditTarget::FrameOffsetY, "7".into(), cx);
+            panel.commit_edit(EditTarget::FrameOffsetY, "nope".into(), cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.frames[frame].offset, (-3, 7));
+            assert_eq!(state.clips[0].entries[1], entry_before, "entry untouched");
+            assert_eq!(
+                SpritePanel::edit_display_text(
+                    &EditTarget::FrameOffsetX,
+                    state,
+                    ready(panel).selected_entry,
+                    ready(panel).selected_frame
+                ),
+                "-3"
+            );
         });
     }
 

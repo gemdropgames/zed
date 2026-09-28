@@ -176,7 +176,7 @@ mod tests {
     use ggo_worldlib::sprites::hw::TILE_BYTES;
 
     fn frame() -> Frame {
-        Frame { map: vec![0] }
+        Frame { offset: (0, 0), map: vec![0] }
     }
 
     fn state(frames: usize, footprint: (u8, u8)) -> SpriteState {
