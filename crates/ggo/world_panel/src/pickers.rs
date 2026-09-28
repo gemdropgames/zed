@@ -1109,13 +1109,14 @@ impl AssetStemModal {
         &self.picker
     }
 
-    /// A confirmed pick: through `WorldPanel::pick_stem`, the same
-    /// commit/undo/resync path Enter and a clicked inline suggestion
-    /// already use.
-    fn confirm(&mut self, stem: String, window: &mut Window, cx: &mut Context<Self>) {
+    /// A confirmed pick: through `WorldPanel::commit_picked_stem`, the
+    /// same op-apply path `pick_stem`'s editor round-trip commits
+    /// through -- there is no rendered editor behind a `.spr` field's row
+    /// for this to update.
+    fn confirm(&mut self, stem: String, cx: &mut Context<Self>) {
         let target = self.target.clone();
         self.panel
-            .update(cx, |panel, cx| panel.pick_stem(target, stem, window, cx))
+            .update(cx, |panel, cx| panel.commit_picked_stem(target, stem, cx))
             .ok();
         cx.emit(DismissEvent);
     }
@@ -1234,13 +1235,11 @@ impl PickerDelegate for AssetStemDelegate {
         })
     }
 
-    fn confirm(&mut self, _secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+    fn confirm(&mut self, _secondary: bool, _window: &mut Window, cx: &mut Context<Picker<Self>>) {
         let Some(stem) = self.stem_at(self.selected_index) else {
             return;
         };
-        self.modal
-            .update(cx, |modal, cx| modal.confirm(stem, window, cx))
-            .ok();
+        self.modal.update(cx, |modal, cx| modal.confirm(stem, cx)).ok();
     }
 
     fn dismissed(&mut self, _: &mut Window, cx: &mut Context<Picker<Self>>) {
