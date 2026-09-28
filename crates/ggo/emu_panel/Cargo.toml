@@ -39,6 +39,7 @@ ggo_charts_panel.workspace = true # GGO -- S4's Re-run entry hands the run it ju
 ggo_common.workspace = true # GGO -- the shared child-process runner, also with the charts/emerald panels
 ggo_daemon_client.workspace = true # GGO -- hardware runs go through the daemon, see `job_stream`
 ggo_world_panel.workspace = true # GGO -- S4's "Emulate this world" saves that panel's doc and reuses its world-path rule
+ggo_sprite_panel.workspace = true # GGO -- the sprite_* MCP tools drive SpritePanel's remote_* API the same way the world_* tools drive WorldPanel's
 # GGO -- the report row types and `MAX_FRAMES`, both pure. Default
 # features only: the `db` feature is what would drag sqlx back in, and the
 # flashed-run lookup goes through the daemon now.
@@ -73,6 +74,7 @@ gemdrop-sdk.workspace = true # GGO
 # genuinely dirty world document in a real directory -- see that feature's
 # comment in ggo_world_panel/Cargo.toml.
 ggo_world_panel = { workspace = true, features = ["test-support"] }
+ggo_sprite_panel = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 path = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }

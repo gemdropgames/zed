@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use base64::Engine as _;
-use gpui::{AnyWindowHandle, App, AppContext as _, AsyncApp, Entity, Global, WeakEntity};
+use gpui::{AnyWindowHandle, App, AppContext as _, AsyncApp, Context, Entity, Global, WeakEntity};
 use workspace::Workspace;
 use ggo_emu_remote::protocol::{Cmd, Request, Response, parse_request, response_line};
 use ggo_emu_remote::registry::{self, SessionInfo};
@@ -303,6 +303,22 @@ fn world_value(panel: &WeakEntity<EmuPanel>, cx: &mut AsyncApp) -> serde_json::V
     }
 }
 
+/// `path` (absolute or workspace-root-relative) as an absolute path --
+/// resolved HERE, not by the MCP host: `target_root` is this dispatch's
+/// own already-disambiguated workspace, which the host cannot always
+/// re-derive from `workspace`/`session` alone (a session can list more
+/// than one workspace). The host writes the actual PNG bytes (it already
+/// owns the encoder, `emu_mcp::png::bgra_to_png`); this only tells it
+/// where.
+fn resolve_write_path(target_root: &str, path: &str) -> String {
+    let path = std::path::Path::new(path);
+    if path.is_absolute() {
+        path.to_string_lossy().into_owned()
+    } else {
+        std::path::Path::new(target_root).join(path).to_string_lossy().into_owned()
+    }
+}
+
 /// A framebuffer as the wire carries it; the bridge turns it into PNG.
 pub(crate) fn bgra_reply(width: u32, height: u32, bgra: &[u8]) -> serde_json::Value {
     serde_json::json!({
@@ -445,6 +461,165 @@ async fn await_world_ready<T>(
             Err(reason) => return Err(reason),
         }
     }
+}
+
+/// A panel that can answer questions about the PROJECT's sprites -- the
+/// listing, and resolution of the name the agent typed. Any open sprite
+/// tab's panel when there is one (listing/resolving only need the
+/// project root, so it doesn't matter which), otherwise a throwaway --
+/// zero open sprite tabs is the normal state for the first call an agent
+/// makes.
+///
+/// MUST NOT be called while the workspace is leased: the listing reads
+/// the workspace to find the project root.
+fn sprite_resolver(
+    workspace: &Entity<Workspace>,
+    app: &mut App,
+) -> Entity<ggo_sprite_panel::SpritePanel> {
+    let existing = workspace
+        .read(app)
+        .items_of_type::<ggo_sprite_panel::SpriteEditorItem>(app)
+        .next()
+        .map(|item| item.read(app).panel().clone());
+    existing.unwrap_or_else(|| {
+        let workspace = workspace.downgrade();
+        app.new(|cx| ggo_sprite_panel::SpritePanel::new(Some(workspace), cx))
+    })
+}
+
+/// The sprite tab in front, for a `SpriteRead`/`SpriteSave`/... with no
+/// `sprite` argument. `Err` when the active tab isn't a sprite (a world,
+/// a text buffer, nothing).
+fn sprite_panel_for(
+    workspace: &Entity<Workspace>,
+    window: AnyWindowHandle,
+    cx: &mut AsyncApp,
+) -> Result<Entity<ggo_sprite_panel::SpritePanel>, String> {
+    window
+        .update(cx, |_, _window, app| {
+            workspace
+                .read(app)
+                .active_item(app)
+                .and_then(|item| item.downcast::<ggo_sprite_panel::SpriteEditorItem>())
+                .map(|item| item.read(app).panel().clone())
+                .ok_or_else(|| "no sprite open".to_string())
+        })
+        .map_err(|e| e.to_string())?
+}
+
+/// The panel showing `sprite` (a stem or a rel path), opening (or
+/// focusing) a tab for it via [`ggo_sprite_panel::open_sprite_item`] --
+/// which never reloads an already-open tab, so unsaved edits, undo
+/// history and any live playback survive -- plus the rel it resolved to.
+fn sprite_panel_open(
+    workspace: &Entity<Workspace>,
+    window: AnyWindowHandle,
+    sprite: &str,
+    cx: &mut AsyncApp,
+) -> Result<(Entity<ggo_sprite_panel::SpritePanel>, String), String> {
+    window
+        .update(cx, |_, window, app| {
+            // Resolved BEFORE the workspace update below, never inside
+            // it: resolving re-enumerates the project's sprites, which
+            // reads the workspace, and reading it while leased panics
+            // (`world_panel_open`'s same rule).
+            let rel = sprite_resolver(workspace, app)
+                .update(app, |panel, cx| panel.remote_resolve(sprite, cx))?;
+            let panel = workspace.update(app, |workspace, cx| {
+                ggo_sprite_panel::open_sprite_item(workspace, rel.clone(), window, cx);
+                workspace
+                    .items_of_type::<ggo_sprite_panel::SpriteEditorItem>(cx)
+                    .find(|item| item.read(cx).rel() == rel)
+                    .map(|item| item.read(cx).panel().clone())
+            });
+            panel.map(|panel| (panel, rel)).ok_or_else(|| "the sprite tab could not open".to_string())
+        })
+        .map_err(|e| e.to_string())?
+}
+
+/// A sprite tab's `require_open` rejection worth retrying rather than
+/// failing on: the off-thread load itself
+/// ([`ggo_sprite_panel::SPRITE_STILL_LOADING`]), or the brief window
+/// right after a BRAND NEW tab opens where the panel is still
+/// `Empty` -- `SpritePanel::open_rel_path` defers even the transition to
+/// `Loading` past the workspace's lease (unlike `WorldPanel`'s
+/// `mark_loading`, which stamps `Loading` synchronously at creation), so
+/// a call landing before that deferred step's first poll sees "no sprite
+/// open" for one tick. A tab that will NEVER load (the "New Sprite…"
+/// form's empty host) also reads this way; retrying it for up to 5s
+/// before failing is an acceptable cost for not needing to tell the two
+/// apart.
+fn sprite_settling(reason: &str) -> bool {
+    reason.contains(ggo_sprite_panel::SPRITE_STILL_LOADING) || reason.contains("no sprite open")
+}
+
+/// [`await_world_ready`]'s twin for sprites.
+async fn await_sprite_ready<T>(
+    panel: &Entity<ggo_sprite_panel::SpritePanel>,
+    cx: &mut AsyncApp,
+    read: impl Fn(&ggo_sprite_panel::SpritePanel) -> Result<T, String>,
+) -> Result<T, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match panel.update(cx, |p, _| read(p)) {
+            Ok(value) => return Ok(value),
+            Err(reason) if sprite_settling(&reason) && std::time::Instant::now() < deadline => {
+                cx.background_executor().timer(std::time::Duration::from_millis(50)).await;
+            }
+            Err(reason) => return Err(reason),
+        }
+    }
+}
+
+/// [`await_sprite_ready`] for an op that MUTATES the panel (a clip tool,
+/// a save): `write` is re-invoked on every retry, so its captured
+/// arguments must be cheaply re-usable (the clip tools clone their small
+/// owned entry lists per attempt).
+async fn await_sprite_ready_mut<T>(
+    panel: &Entity<ggo_sprite_panel::SpritePanel>,
+    cx: &mut AsyncApp,
+    mut write: impl FnMut(&mut ggo_sprite_panel::SpritePanel, &mut Context<ggo_sprite_panel::SpritePanel>) -> Result<T, String>,
+) -> Result<T, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match panel.update(cx, |p, cx| write(p, cx)) {
+            Ok(value) => return Ok(value),
+            Err(reason) if sprite_settling(&reason) && std::time::Instant::now() < deadline => {
+                cx.background_executor().timer(std::time::Duration::from_millis(50)).await;
+            }
+            Err(reason) => return Err(reason),
+        }
+    }
+}
+
+/// A wire [`ggo_emu_remote::protocol::ClipRef`] as
+/// [`ggo_sprite_panel::ClipLookup`] -- the two are the same shape; kept
+/// as distinct types so `ggo_sprite_panel` carries no dependency on the
+/// wire protocol.
+fn clip_lookup(clip: ggo_emu_remote::protocol::ClipRef) -> ggo_sprite_panel::ClipLookup {
+    match clip {
+        ggo_emu_remote::protocol::ClipRef::Index(i) => ggo_sprite_panel::ClipLookup::Index(i),
+        ggo_emu_remote::protocol::ClipRef::Name(n) => ggo_sprite_panel::ClipLookup::Name(n),
+    }
+}
+
+/// A wire [`ggo_emu_remote::protocol::ClipEntryArg`] as a worldlib
+/// [`ggo_worldlib::sprites::cow::ClipEntry`] -- an omitted
+/// `duration_ms`/`offset` takes [`ggo_worldlib::sprites::cow::ClipEntry::of_frame`]'s
+/// default rather than zero.
+fn clip_entry_from_arg(
+    arg: ggo_emu_remote::protocol::ClipEntryArg,
+) -> ggo_worldlib::sprites::cow::ClipEntry {
+    let mut entry = ggo_worldlib::sprites::cow::ClipEntry::of_frame(arg.frame);
+    if let Some(duration_ms) = arg.duration_ms {
+        entry.duration_ms = duration_ms;
+    }
+    entry.flip_h = arg.flip_h;
+    entry.flip_v = arg.flip_v;
+    if let Some(offset) = arg.offset {
+        entry.offset = offset;
+    }
+    entry
 }
 
 /// The workspace's emu panel, opening one if none is up.
@@ -652,7 +827,16 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
         | Cmd::WorldList { workspace }
         | Cmd::WorldOpen { workspace, .. }
         | Cmd::WorldRead { workspace, .. }
-        | Cmd::WorldScreenshot { workspace, .. } => workspace.clone(),
+        | Cmd::WorldScreenshot { workspace, .. }
+        | Cmd::SpriteList { workspace }
+        | Cmd::SpriteOpen { workspace, .. }
+        | Cmd::SpriteRead { workspace, .. }
+        | Cmd::SpriteClipCreate { workspace, .. }
+        | Cmd::SpriteClipUpdate { workspace, .. }
+        | Cmd::SpriteClipDelete { workspace, .. }
+        | Cmd::SpriteSave { workspace, .. }
+        | Cmd::SpriteReferenceSheet { workspace, .. }
+        | Cmd::SpriteTilesetImage { workspace, .. } => workspace.clone(),
     };
     let keys: Vec<String> = targets.iter().map(|t| t.root.clone()).collect();
     let target_root = resolve_workspace(&keys, workspace_arg.as_deref())?;
@@ -966,6 +1150,96 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
                 await_world_ready(&panel, cx, |p| p.remote_screenshot(full)).await?;
             Ok(bgra_reply(width, height, &bgra))
         }
+        Cmd::SpriteList { .. } => {
+            let workspace = target.workspace.ok_or("workspace vanished")?;
+            let sprites = window
+                .update(cx, |_, _window, app| {
+                    sprite_resolver(&workspace, app).update(app, |p, cx| p.remote_list(cx))
+                })
+                .map_err(|e| e.to_string())?;
+            let rows: Vec<serde_json::Value> = sprites
+                .into_iter()
+                .map(|(stem, rel_path)| serde_json::json!({ "stem": stem, "rel_path": rel_path }))
+                .collect();
+            Ok(serde_json::json!({ "sprites": rows }))
+        }
+        Cmd::SpriteOpen { sprite, .. } => {
+            let workspace = target.workspace.ok_or("workspace vanished")?;
+            let (_panel, rel) = sprite_panel_open(&workspace, window, &sprite, cx)?;
+            Ok(serde_json::json!({ "opened": rel }))
+        }
+        Cmd::SpriteRead { sprite, .. } => {
+            let workspace = target.workspace.ok_or("workspace vanished")?;
+            let panel = match sprite {
+                Some(sprite) => sprite_panel_open(&workspace, window, &sprite, cx)?.0,
+                None => sprite_panel_for(&workspace, window, cx)?,
+            };
+            await_sprite_ready(&panel, cx, |p| p.remote_read()).await
+        }
+        Cmd::SpriteClipCreate { sprite, name, loop_, entries, .. } => {
+            let workspace = target.workspace.ok_or("workspace vanished")?;
+            let panel = sprite_panel_open(&workspace, window, &sprite, cx)?.0;
+            let entries: Vec<_> = entries.into_iter().map(clip_entry_from_arg).collect();
+            await_sprite_ready_mut(&panel, cx, move |p, cx| {
+                p.remote_clip_create(name.clone(), loop_, entries.clone(), cx)
+            })
+            .await
+        }
+        Cmd::SpriteClipUpdate { sprite, clip, name, loop_, entries, .. } => {
+            let workspace = target.workspace.ok_or("workspace vanished")?;
+            let panel = sprite_panel_open(&workspace, window, &sprite, cx)?.0;
+            let entries =
+                entries.map(|entries| entries.into_iter().map(clip_entry_from_arg).collect::<Vec<_>>());
+            let clip = clip_lookup(clip);
+            await_sprite_ready_mut(&panel, cx, move |p, cx| {
+                p.remote_clip_update(clip.clone(), name.clone(), loop_, entries.clone(), cx)
+            })
+            .await
+        }
+        Cmd::SpriteClipDelete { sprite, clip, .. } => {
+            let workspace = target.workspace.ok_or("workspace vanished")?;
+            let panel = sprite_panel_open(&workspace, window, &sprite, cx)?.0;
+            let clip = clip_lookup(clip);
+            await_sprite_ready_mut(&panel, cx, move |p, cx| p.remote_clip_delete(clip.clone(), cx)).await
+        }
+        Cmd::SpriteSave { sprite, .. } => {
+            let workspace = target.workspace.ok_or("workspace vanished")?;
+            let panel = sprite_panel_open(&workspace, window, &sprite, cx)?.0;
+            let saved = await_sprite_ready_mut(&panel, cx, |p, cx| p.remote_save(cx)).await?;
+            Ok(serde_json::json!({ "saved": saved }))
+        }
+        Cmd::SpriteReferenceSheet { sprite, path, .. } => {
+            let workspace = target.workspace.ok_or("workspace vanished")?;
+            let panel = sprite_panel_open(&workspace, window, &sprite, cx)?.0;
+            let (width, height, bgra, sheet) =
+                await_sprite_ready(&panel, cx, |p| p.remote_reference_sheet()).await?;
+            let mut reply = bgra_reply(width, height, &bgra);
+            let reply_object = reply.as_object_mut().expect("bgra_reply returns an object");
+            reply_object.insert("cols".to_string(), serde_json::json!(sheet.cols));
+            reply_object.insert("rows".to_string(), serde_json::json!(sheet.rows));
+            reply_object.insert("tiles".to_string(), serde_json::json!(sheet.tiles));
+            if let Some(path) = path {
+                reply_object.insert(
+                    "write_to".to_string(),
+                    serde_json::json!(resolve_write_path(&target_root, &path)),
+                );
+            }
+            Ok(reply)
+        }
+        Cmd::SpriteTilesetImage { sprite, path, .. } => {
+            let workspace = target.workspace.ok_or("workspace vanished")?;
+            let panel = sprite_panel_open(&workspace, window, &sprite, cx)?.0;
+            let (width, height, bgra) =
+                await_sprite_ready(&panel, cx, |p| p.remote_tileset_image()).await?;
+            let mut reply = bgra_reply(width, height, &bgra);
+            if let Some(path) = path {
+                reply.as_object_mut().expect("bgra_reply returns an object").insert(
+                    "write_to".to_string(),
+                    serde_json::json!(resolve_write_path(&target_root, &path)),
+                );
+            }
+            Ok(reply)
+        }
         Cmd::Stop { .. } => {
             let panel = target.panel.ok_or("no emu panel open in this workspace")?;
             let uart = panel.update(cx, |p, _| p.remote_uart(None)).unwrap_or_default();
@@ -1001,6 +1275,7 @@ mod tests {
             AppState::test(cx);
             crate::init(cx);
             ggo_world_panel::init(cx);
+            ggo_sprite_panel::init(cx);
         });
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
@@ -1137,6 +1412,387 @@ mod tests {
                 "and no viewer cart was built for it"
             );
         });
+    }
+
+    /// A real `.spr`/`.til`/`.pal` trio under `sprites/<stem>` -- a
+    /// 1x1-tile, 2-frame, 2-tile sprite, no clips. Written to the REAL
+    /// filesystem the same way `write_sprite_fixture` in
+    /// `ggo_sprite_panel`'s own tests is (that helper is `pub(crate)`
+    /// there and unreachable from this crate).
+    fn write_sprite_fixture_named(root: &std::path::Path, stem: &str) {
+        use ggo_worldlib::sprites::cow::{Frame, SpriteState};
+        use ggo_worldlib::sprites::hw::TILE_BYTES;
+        use ggo_worldlib::sprites::io::save_sprite;
+
+        let mut pool = vec![0u8; 2 * TILE_BYTES];
+        for b in &mut pool[TILE_BYTES..] {
+            *b = 0x11;
+        }
+        let mut palette = [0u16; 16];
+        palette[1] = 0xF800;
+        let state = SpriteState {
+            pool,
+            tile_count: 2,
+            session_tiles: std::collections::HashSet::new(),
+            palette,
+            frames: vec![Frame { map: vec![0] }, Frame { map: vec![1] }],
+            clips: vec![],
+            w_tiles: 1,
+            h_tiles: 1,
+            pool_shared: false,
+        };
+        save_sprite(
+            root,
+            &format!("sprites/{stem}.spr"),
+            &state,
+            &format!("sprites/{stem}.til"),
+            &format!("sprites/{stem}.pal"),
+        )
+        .unwrap();
+    }
+
+    /// `sprite_open` is the FIRST call an agent makes, with no sprite tab
+    /// open and nothing for `active_item` to answer with: it has to
+    /// resolve the name against the project anyway, open the tab, and
+    /// leave `sprite_read` able to answer from it.
+    #[gpui::test]
+    async fn sprite_open_opens_the_first_tab_and_sprite_read_answers_from_it(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
+        write_sprite_fixture_named(dir.path(), "hero");
+        let (workspace, cx) = remote_workspace(cx, dir.path()).await;
+        let mut async_cx = cx.to_async();
+
+        let opened = dispatch_inner(
+            Cmd::SpriteOpen { workspace: None, sprite: "sprites/hero".to_string() },
+            &mut async_cx,
+        )
+        .await
+        .expect("sprite_open with no tab open");
+        assert_eq!(opened["opened"], "sprites/hero.spr");
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.items_of_type::<ggo_sprite_panel::SpriteEditorItem>(cx).count(),
+                1,
+                "the open gave the sprite its own center tab"
+            );
+        });
+
+        let read = dispatch_inner(Cmd::SpriteRead { workspace: None, sprite: None }, &mut async_cx)
+            .await
+            .expect("sprite_read answers from the tab sprite_open left active");
+        assert_eq!(read["rel_path"], "sprites/hero.spr");
+        assert_eq!(read["frame_count"], 2);
+        assert_eq!(read["dirty"], false);
+    }
+
+    /// Re-opening a sprite already open must focus the existing tab, not
+    /// reload it -- a second `sprite_open` must not add a second tab.
+    #[gpui::test]
+    async fn sprite_open_on_an_already_open_sprite_focuses_it_instead_of_adding_a_tab(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
+        write_sprite_fixture_named(dir.path(), "hero");
+        let (workspace, cx) = remote_workspace(cx, dir.path()).await;
+        let mut async_cx = cx.to_async();
+
+        for _ in 0..2 {
+            dispatch_inner(
+                Cmd::SpriteOpen { workspace: None, sprite: "sprites/hero".to_string() },
+                &mut async_cx,
+            )
+            .await
+            .expect("sprite_open");
+            cx.run_until_parked();
+        }
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.items_of_type::<ggo_sprite_panel::SpriteEditorItem>(cx).count(),
+                1,
+                "the second open focused the same tab"
+            );
+        });
+    }
+
+    /// The three clip tools apply real `DocOp`s (undoable, live-composed)
+    /// through `SpritePanel::apply_doc` and leave the document dirty --
+    /// `sprite_save` is a separate step.
+    #[gpui::test]
+    async fn sprite_clip_tools_apply_doc_changes_and_leave_the_doc_dirty(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
+        write_sprite_fixture_named(dir.path(), "hero");
+        let (_workspace, cx) = remote_workspace(cx, dir.path()).await;
+        let mut async_cx = cx.to_async();
+
+        let created = dispatch_inner(
+            Cmd::SpriteClipCreate {
+                workspace: None,
+                sprite: "sprites/hero".to_string(),
+                name: "walk".to_string(),
+                loop_: true,
+                entries: vec![ggo_emu_remote::protocol::ClipEntryArg {
+                    frame: 1,
+                    duration_ms: Some(80),
+                    flip_h: true,
+                    flip_v: false,
+                    offset: None,
+                }],
+            },
+            &mut async_cx,
+        )
+        .await
+        .expect("sprite_clip_create");
+        assert_eq!(created["index"], 0);
+        assert_eq!(created["name"], "walk");
+        assert_eq!(created["entries"][0]["duration_ms"], 80);
+
+        let read = dispatch_inner(
+            Cmd::SpriteRead { workspace: None, sprite: Some("sprites/hero".to_string()) },
+            &mut async_cx,
+        )
+        .await
+        .expect("sprite_read");
+        assert_eq!(read["dirty"], true, "a clip create leaves the doc dirty");
+        assert_eq!(read["clips"].as_array().unwrap().len(), 1);
+
+        let updated = dispatch_inner(
+            Cmd::SpriteClipUpdate {
+                workspace: None,
+                sprite: "sprites/hero".to_string(),
+                clip: ggo_emu_remote::protocol::ClipRef::Name("walk".to_string()),
+                name: Some("run".to_string()),
+                loop_: None,
+                entries: None,
+            },
+            &mut async_cx,
+        )
+        .await
+        .expect("sprite_clip_update");
+        assert_eq!(updated["name"], "run");
+
+        let deleted = dispatch_inner(
+            Cmd::SpriteClipDelete {
+                workspace: None,
+                sprite: "sprites/hero".to_string(),
+                clip: ggo_emu_remote::protocol::ClipRef::Index(0),
+            },
+            &mut async_cx,
+        )
+        .await
+        .expect("sprite_clip_delete");
+        assert_eq!(deleted["index"], 0);
+        assert_eq!(deleted["name"], "run");
+
+        let read = dispatch_inner(Cmd::SpriteRead { workspace: None, sprite: None }, &mut async_cx)
+            .await
+            .expect("sprite_read");
+        assert_eq!(read["clips"].as_array().unwrap().len(), 0, "the delete landed");
+    }
+
+    /// `sprite_clip_update`/`sprite_clip_delete` naming a clip index out
+    /// of range, or a name shared by two clips, must error rather than
+    /// guess.
+    #[gpui::test]
+    async fn sprite_clip_update_rejects_a_bad_index_and_an_ambiguous_name(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
+        write_sprite_fixture_named(dir.path(), "hero");
+        let (_workspace, cx) = remote_workspace(cx, dir.path()).await;
+        let mut async_cx = cx.to_async();
+
+        for _ in 0..2 {
+            dispatch_inner(
+                Cmd::SpriteClipCreate {
+                    workspace: None,
+                    sprite: "sprites/hero".to_string(),
+                    name: "walk".to_string(),
+                    loop_: false,
+                    entries: vec![],
+                },
+                &mut async_cx,
+            )
+            .await
+            .expect("sprite_clip_create");
+        }
+
+        let err = dispatch_inner(
+            Cmd::SpriteClipUpdate {
+                workspace: None,
+                sprite: "sprites/hero".to_string(),
+                clip: ggo_emu_remote::protocol::ClipRef::Index(9),
+                name: Some("run".to_string()),
+                loop_: None,
+                entries: None,
+            },
+            &mut async_cx,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("out of range"), "{err}");
+
+        let err = dispatch_inner(
+            Cmd::SpriteClipUpdate {
+                workspace: None,
+                sprite: "sprites/hero".to_string(),
+                clip: ggo_emu_remote::protocol::ClipRef::Name("walk".to_string()),
+                name: Some("run".to_string()),
+                loop_: None,
+                entries: None,
+            },
+            &mut async_cx,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("index"), "{err}");
+    }
+
+    /// `sprite_save` writes the same fold-back save the editor's own Save
+    /// button does, and clears `dirty`.
+    #[gpui::test]
+    async fn sprite_save_clears_dirty_and_persists(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
+        write_sprite_fixture_named(dir.path(), "hero");
+        let (_workspace, cx) = remote_workspace(cx, dir.path()).await;
+        let mut async_cx = cx.to_async();
+
+        dispatch_inner(
+            Cmd::SpriteClipCreate {
+                workspace: None,
+                sprite: "sprites/hero".to_string(),
+                name: "walk".to_string(),
+                loop_: false,
+                entries: vec![],
+            },
+            &mut async_cx,
+        )
+        .await
+        .expect("sprite_clip_create");
+
+        let saved = dispatch_inner(
+            Cmd::SpriteSave { workspace: None, sprite: "sprites/hero".to_string() },
+            &mut async_cx,
+        )
+        .await
+        .expect("sprite_save");
+        assert_eq!(saved["saved"], "sprites/hero.spr");
+
+        let read = dispatch_inner(Cmd::SpriteRead { workspace: None, sprite: None }, &mut async_cx)
+            .await
+            .expect("sprite_read");
+        assert_eq!(read["dirty"], false, "the save cleared dirty");
+
+        let reopened = ggo_worldlib::sprites::io::open_sprite(dir.path(), "sprites/hero.spr")
+            .expect("the trio is still readable");
+        assert_eq!(reopened.state.clips.len(), 1, "the save reached disk");
+    }
+
+    /// Every project `.spr`.
+    #[gpui::test]
+    async fn sprite_list_reports_every_spr_in_the_project(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
+        write_sprite_fixture_named(dir.path(), "hero");
+        write_sprite_fixture_named(dir.path(), "villain");
+        let (_workspace, cx) = remote_workspace(cx, dir.path()).await;
+        let mut async_cx = cx.to_async();
+
+        let listed =
+            dispatch_inner(Cmd::SpriteList { workspace: None }, &mut async_cx).await.expect("sprite_list");
+        let stems: Vec<&str> = listed["sprites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["stem"].as_str().unwrap())
+            .collect();
+        assert_eq!(stems, vec!["sprites/hero", "sprites/villain"]);
+    }
+
+    /// No reference sheet was ever recorded for `hero`'s tileset (a
+    /// stale/fresh import); `hero2`'s WAS, before its tab ever opened, so
+    /// the composed image and the sheet's own `{cols, rows, tiles}` come
+    /// back together.
+    #[gpui::test]
+    async fn sprite_reference_sheet_errors_when_absent_and_returns_image_when_present(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
+        write_sprite_fixture_named(dir.path(), "hero");
+        write_sprite_fixture_named(dir.path(), "hero2");
+        ggo_sprite_panel::reference_sheet::save(
+            dir.path(),
+            "sprites/hero2.til",
+            &ggo_sprite_panel::reference_sheet::ReferenceSheet {
+                cols: 2,
+                rows: 1,
+                tiles: vec![0, 1],
+            },
+        )
+        .unwrap();
+        let (_workspace, cx) = remote_workspace(cx, dir.path()).await;
+        let mut async_cx = cx.to_async();
+
+        let err = dispatch_inner(
+            Cmd::SpriteReferenceSheet {
+                workspace: None,
+                sprite: "sprites/hero".to_string(),
+                path: None,
+            },
+            &mut async_cx,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("reference"), "{err}");
+
+        let ok = dispatch_inner(
+            Cmd::SpriteReferenceSheet {
+                workspace: None,
+                sprite: "sprites/hero2".to_string(),
+                path: None,
+            },
+            &mut async_cx,
+        )
+        .await
+        .expect("hero2 carries a recorded reference sheet");
+        assert_eq!(ok["cols"], 2);
+        assert_eq!(ok["rows"], 1);
+        assert_eq!(ok["tiles"], serde_json::json!([0, 1]));
+        assert!(!ok["bgra_base64"].as_str().unwrap().is_empty());
+    }
+
+    /// The pool grid's dimensions are a multiple of one tile wide and
+    /// exactly one tile tall for a 2-tile pool (narrower than the fixed
+    /// column count).
+    #[gpui::test]
+    async fn sprite_tileset_image_reports_dims(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
+        write_sprite_fixture_named(dir.path(), "hero");
+        let (_workspace, cx) = remote_workspace(cx, dir.path()).await;
+        let mut async_cx = cx.to_async();
+
+        let image = dispatch_inner(
+            Cmd::SpriteTilesetImage {
+                workspace: None,
+                sprite: "sprites/hero".to_string(),
+                path: None,
+            },
+            &mut async_cx,
+        )
+        .await
+        .expect("sprite_tileset_image");
+        let tile_px = u64::from(ggo_worldlib::sprites::hw::TILE_PX as u32);
+        assert_eq!(image["height"], tile_px);
+        assert_eq!(image["width"].as_u64().unwrap() % tile_px, 0);
     }
 
     #[test]

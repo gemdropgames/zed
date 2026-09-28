@@ -7538,6 +7538,7 @@ dependencies = [
  "ggo_common",
  "ggo_daemon_client",
  "ggo_emu_remote",
+ "ggo_sprite_panel",
  "ggo_world_panel",
  "gpui",
  "image",
