@@ -6878,6 +6878,38 @@ impl WorldPanel {
         cx.notify();
     }
 
+    /// Raise the fuzzy sprite picker ([`pickers::AssetStemModal`]) for a
+    /// `.spr` Asset field's magnifier button, over every `.spr` stem in
+    /// the project. Gathers everything the modal needs here and raises
+    /// it from the SAME update, matching
+    /// [`Self::open_add_instance_card`]'s reasoning.
+    fn open_asset_stem_modal(
+        &mut self,
+        target: inspector::FieldTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(workspace), ViewerState::Ready(open)) = (
+            self.workspace.as_ref().and_then(|w| w.upgrade()),
+            &self.state,
+        ) else {
+            return;
+        };
+        let root = open.root.clone();
+        let current_stem = open
+            .inspector
+            .iter()
+            .find(|entry| entry.target == target)
+            .map(|entry| entry.editor.read(cx).text(cx));
+        let candidates = list_asset_stems(&root, "spr");
+        let panel = cx.entity().downgrade();
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                pickers::AssetStemModal::new(panel, target, candidates, current_stem, window, cx)
+            });
+        });
+    }
+
     /// Blur commits the field, matching the brief's enter/blur rule (and
     /// ggo-ide's cross-field commit-on-input). An unchanged or unparsable
     /// buffer is a no-op in the store, so committing every blur is safe.
@@ -9910,8 +9942,52 @@ impl WorldPanel {
                                             ),
                                         );
                                     }
+                                    // `.spr` fields trade the inline
+                                    // suggestion list for the fuzzy
+                                    // picker modal -- a project can carry
+                                    // far more sprites than a scroll-free
+                                    // inline list reads well.
+                                    let is_spr = ext == "spr";
+                                    if is_spr {
+                                        let pick_target = target.clone();
+                                        let selector_id =
+                                            format!("ggo-pick-stem-{component}-{field}");
+                                        // The wrapper carries the
+                                        // `debug_selector`: `IconButton`
+                                        // defaults its own to the icon
+                                        // name, not the id passed to
+                                        // `new`, so a test could never
+                                        // find this button by field
+                                        // without the wrapper (the "+
+                                        // Instance" button's own comment
+                                        // explains the same trap).
+                                        row = row.child(
+                                            div()
+                                                .debug_selector({
+                                                    let selector_id = selector_id.clone();
+                                                    move || selector_id
+                                                })
+                                                .child(
+                                                    IconButton::new(
+                                                        SharedString::from(selector_id),
+                                                        IconName::MagnifyingGlass,
+                                                    )
+                                                    .icon_size(IconSize::XSmall)
+                                                    .tooltip(ui::Tooltip::text("Pick a sprite…"))
+                                                    .on_click(cx.listener(
+                                                        move |this, _, window, cx| {
+                                                            this.open_asset_stem_modal(
+                                                                pick_target.clone(),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        },
+                                                    )),
+                                                ),
+                                        );
+                                    }
                                     panel = panel.child(row);
-                                    if let Some(suggestions) =
+                                    if !is_spr && let Some(suggestions) =
                                         self.render_stem_suggestions(&target, editor, cx)
                                     {
                                         panel = panel.child(suggestions);
@@ -12040,13 +12116,151 @@ mod tests {
     /// A real CLICK on a rendered stem suggestion (not a direct
     /// `pick_stem` call) must fill and commit the field -- covers the
     /// element wiring end to end, including surviving whatever the click
-    /// does to the editor's focus.
+    /// does to the editor's focus. `Text.font` (a `.til` field), not
+    /// `Sprite.stem`: `.spr` fields dropped the inline list for the
+    /// picker modal (see `test_spr_field_button_replaces_inline_suggestions`).
     #[gpui::test]
     async fn test_clicking_a_stem_suggestion_fills_the_field(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tilesets")).unwrap();
+        std::fs::write(dir.path().join("tilesets/main.til"), "").unwrap();
+        let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.store.apply(WorldOp::AddComponent {
+                entity: 2,
+                name: "Text".to_string(),
+                defaults: serde_json::json!({"font": ""})
+                    .as_object()
+                    .expect("object literal")
+                    .clone(),
+            });
+            open.selected = vec![Selection::Entity(2)];
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let editor = field_editor(&panel, cx, "Text", "font");
+        panel.update_in(cx, |panel, window, cx| {
+            window.focus(&editor.focus_handle(cx), cx);
+            panel.refresh_stem_completion(window, cx);
+        });
+        cx.run_until_parked();
+
+        let bounds = cx
+            .debug_bounds("ggo-stem-suggestion-tilesets/main")
+            .expect("the focused empty font field lists the project's tilesets");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, cx| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert_eq!(
+                open.store.state().entities[2].components["Text"]["font"],
+                json!("tilesets/main"),
+                "the click must commit the stem"
+            );
+            assert_eq!(
+                editor.read(cx).text(cx),
+                "tilesets/main",
+                "and the field shows it"
+            );
+        });
+    }
+
+    /// `.spr` fields (`Sprite.stem`, `MetaSprite.stem`, any user
+    /// `asset:spr` field) trade the inline suggestion list for the
+    /// picker-modal button; every other asset extension keeps the list.
+    #[gpui::test]
+    async fn test_spr_field_button_replaces_inline_suggestions(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("sprites")).unwrap();
         std::fs::write(dir.path().join("sprites/gg_icon.spr"), "").unwrap();
+        std::fs::create_dir_all(dir.path().join("tilesets")).unwrap();
+        std::fs::write(dir.path().join("tilesets/main.til"), "").unwrap();
         let (panel, cx) = ready_panel_in_window(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            let ViewerState::Ready(open) = &mut panel.state else {
+                panic!("expected Ready");
+            };
+            open.store.apply(WorldOp::AddComponent {
+                entity: 2,
+                name: "Sprite".to_string(),
+                defaults: serde_json::json!({"stem": ""})
+                    .as_object()
+                    .expect("object literal")
+                    .clone(),
+            });
+            open.store.apply(WorldOp::AddComponent {
+                entity: 2,
+                name: "Text".to_string(),
+                defaults: serde_json::json!({"font": ""})
+                    .as_object()
+                    .expect("object literal")
+                    .clone(),
+            });
+            open.selected = vec![Selection::Entity(2)];
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let sprite_editor = field_editor(&panel, cx, "Sprite", "stem");
+        panel.update_in(cx, |panel, window, cx| {
+            window.focus(&sprite_editor.focus_handle(cx), cx);
+            panel.refresh_stem_completion(window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ggo-pick-stem-Sprite-stem").is_some(),
+            "a spr field shows the picker button"
+        );
+        assert!(
+            cx.debug_bounds("ggo-stem-suggestion-sprites/gg_icon")
+                .is_none(),
+            "a spr field no longer renders the inline suggestion list"
+        );
+
+        let font_editor = field_editor(&panel, cx, "Text", "font");
+        panel.update_in(cx, |panel, window, cx| {
+            window.focus(&font_editor.focus_handle(cx), cx);
+            panel.refresh_stem_completion(window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ggo-pick-stem-Text-font").is_none(),
+            "the picker button is spr-only"
+        );
+        assert!(
+            cx.debug_bounds("ggo-stem-suggestion-tilesets/main")
+                .is_some(),
+            "a non-spr asset field keeps its inline suggestion list"
+        );
+    }
+
+    /// The magnifier button on a `.spr` field raises
+    /// [`pickers::AssetStemModal`] over every project sprite stem; typing
+    /// fuzzy-filters it, and confirm commits the picked stem through the
+    /// same [`WorldPanel::pick_stem`] path a clicked inline suggestion
+    /// used to. Raised through `open_asset_stem_modal` directly, matching
+    /// every other creation-card test here (`card_workspace`'s panel is
+    /// never added to a dock, so it never paints -- the button's own
+    /// render and click wiring is
+    /// `test_spr_field_button_replaces_inline_suggestions`'s job).
+    #[gpui::test]
+    async fn test_pick_stem_button_opens_modal_filters_and_commits(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sprites")).unwrap();
+        std::fs::write(dir.path().join("sprites/gg_icon.spr"), "").unwrap();
+        std::fs::write(dir.path().join("hero.spr"), "").unwrap();
+        let (workspace, panel, cx) = card_workspace(cx, dir.path()).await;
 
         panel.update(cx, |panel, cx| {
             let ViewerState::Ready(open) = &mut panel.state else {
@@ -12060,35 +12274,69 @@ mod tests {
                     .expect("object literal")
                     .clone(),
             });
+            open.selected = vec![Selection::Entity(0)];
             cx.notify();
         });
         cx.run_until_parked();
+        // `card_workspace`'s panel is never added to a dock, so it never
+        // paints -- and `ensure_inspector` (what fills `open.inspector`,
+        // the map `pick_stem`'s commit reads back through) only runs from
+        // `render`. Called directly here, the way a real paint would.
+        panel.update_in(cx, |panel, window, cx| panel.ensure_inspector(window, cx));
 
-        let editor = field_editor(&panel, cx, "Sprite", "stem");
-        panel.update_in(cx, |_, window, cx| {
-            window.focus(&editor.focus_handle(cx), cx);
+        let target = inspector::FieldTarget::EntityField {
+            entity: 0,
+            component: "Sprite".to_string(),
+            field: "stem".to_string(),
+        };
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_asset_stem_modal(target, window, cx)
         });
         cx.run_until_parked();
 
-        let bounds = cx
-            .debug_bounds("ggo-stem-suggestion-sprites/gg_icon")
-            .expect("the focused empty stem field lists the project's sprites");
-        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        let modal = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_modal::<pickers::AssetStemModal>(cx)
+            })
+            .expect("the pick button raises the sprite stem modal");
+        let picker = modal.read_with(cx, |modal, _| modal.picker().clone());
+        assert!(
+            picker
+                .read_with(cx, |picker, _| picker.delegate.match_stems())
+                .contains(&"sprites/gg_icon".to_string()),
+            "every project sprite stem is offered"
+        );
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker.set_query("gg_ic", window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            picker.read_with(cx, |picker, _| picker.delegate.match_stems()),
+            vec!["sprites/gg_icon".to_string()],
+            "the query fuzzy-filters the offered stems"
+        );
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker::PickerDelegate::confirm(&mut picker.delegate, false, window, cx)
+        });
         cx.run_until_parked();
 
-        panel.read_with(cx, |panel, cx| {
+        assert!(
+            workspace
+                .read_with(cx, |workspace, cx| workspace
+                    .active_modal::<pickers::AssetStemModal>(cx))
+                .is_none(),
+            "confirm dismisses the modal"
+        );
+        panel.read_with(cx, |panel, _| {
             let ViewerState::Ready(open) = &panel.state else {
                 panic!("expected Ready");
             };
             assert_eq!(
                 open.store.state().entities[0].components["Sprite"]["stem"],
                 json!("sprites/gg_icon"),
-                "the click must commit the stem"
-            );
-            assert_eq!(
-                editor.read(cx).text(cx),
-                "sprites/gg_icon",
-                "and the field shows it"
+                "confirm commits the picked stem into the entity component"
             );
         });
     }

@@ -35,6 +35,7 @@ use ggo_worldlib::schemas::{ComponentSchema, defaults_for};
 use ggo_worldlib::sprites::tileset_doc::TILE_PX;
 use ggo_worldlib::world_file;
 
+use crate::inspector;
 use crate::{NEW_BG_DIM, WorldPanel};
 
 /// The results column's width. Rems rather than pixels: `Picker` derives
@@ -1058,6 +1059,208 @@ impl PickerDelegate for SchemaPickerDelegate {
                         .color(Color::Muted),
                     ),
                 ),
+        )
+    }
+}
+
+// ------------------------------------------------------------- asset stem
+
+/// The fuzzy stem picker raised by a `.spr` Asset field's magnifier
+/// button (`WorldPanel::open_asset_stem_modal`). No preview pane -- the
+/// inline suggestion list it replaces never had one either -- so the
+/// card is just the picker itself.
+pub struct AssetStemModal {
+    panel: WeakEntity<WorldPanel>,
+    target: inspector::FieldTarget,
+    picker: Entity<Picker<AssetStemDelegate>>,
+}
+
+impl AssetStemModal {
+    pub fn new(
+        panel: WeakEntity<WorldPanel>,
+        target: inspector::FieldTarget,
+        candidates: Vec<String>,
+        current_stem: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let delegate = AssetStemDelegate {
+            modal: cx.weak_entity(),
+            candidates,
+            matches: Vec::new(),
+            selected_index: 0,
+            initial_stem: current_stem,
+        };
+        let picker = cx.new(|cx| {
+            Picker::uniform_list(delegate, window, cx)
+                .embedded()
+                .initial_width(PICKER_WIDTH)
+                .max_height(PICKER_MAX_HEIGHT)
+        });
+        AssetStemModal {
+            panel,
+            target,
+            picker,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn picker(&self) -> &Entity<Picker<AssetStemDelegate>> {
+        &self.picker
+    }
+
+    /// A confirmed pick: through `WorldPanel::pick_stem`, the same
+    /// commit/undo/resync path Enter and a clicked inline suggestion
+    /// already use.
+    fn confirm(&mut self, stem: String, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self.target.clone();
+        self.panel
+            .update(cx, |panel, cx| panel.pick_stem(target, stem, window, cx))
+            .ok();
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for AssetStemModal {}
+
+impl Focusable for AssetStemModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.picker.focus_handle(cx)
+    }
+}
+
+impl ModalView for AssetStemModal {}
+
+impl Render for AssetStemModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let focus_handle = self.focus_handle(cx);
+        card(
+            "ggo-world-asset-stem-card",
+            "Pick a sprite",
+            "Fuzzy-search the project's .spr stems",
+            self.picker.clone().into_any_element(),
+            None,
+            |_, _, _| {},
+            &focus_handle,
+            cx,
+        )
+    }
+}
+
+pub struct AssetStemDelegate {
+    modal: WeakEntity<AssetStemModal>,
+    candidates: Vec<String>,
+    matches: Vec<StringMatch>,
+    selected_index: usize,
+    /// The field's current stem, if any -- highlighted on the picker's
+    /// first (empty-query) render, then cleared so a later query resets
+    /// to row 0 like every other picker here.
+    initial_stem: Option<String>,
+}
+
+impl AssetStemDelegate {
+    fn stem_at(&self, ix: usize) -> Option<String> {
+        let candidate = self.matches.get(ix)?.candidate_id;
+        self.candidates.get(candidate).cloned()
+    }
+
+    /// The stems the current query leaves offered, in row order.
+    #[cfg(test)]
+    pub(crate) fn match_stems(&self) -> Vec<String> {
+        (0..self.matches.len())
+            .filter_map(|ix| self.stem_at(ix))
+            .collect()
+    }
+}
+
+impl PickerDelegate for AssetStemDelegate {
+    type ListItem = ListItem;
+
+    fn name() -> &'static str {
+        "world asset stem"
+    }
+
+    fn placeholder_text(&self, _: &mut Window, _: &mut App) -> Arc<str> {
+        "Pick a sprite…".into()
+    }
+
+    fn match_count(&self) -> usize {
+        self.matches.len()
+    }
+
+    fn selected_index(&self) -> usize {
+        self.selected_index
+    }
+
+    fn set_selected_index(
+        &mut self,
+        ix: usize,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) {
+        self.selected_index = ix;
+    }
+
+    fn update_matches(
+        &mut self,
+        query: String,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Task<()> {
+        let background = cx.background_executor().clone();
+        let candidates: Vec<StringMatchCandidate> = self
+            .candidates
+            .iter()
+            .enumerate()
+            .map(|(id, stem)| StringMatchCandidate::new(id, stem))
+            .collect();
+        let initial_stem = self.initial_stem.take();
+        cx.spawn_in(window, async move |this, cx| {
+            let matches = matches_for(candidates, query, background).await;
+            this.update(cx, |this, cx| {
+                this.delegate.matches = matches;
+                this.delegate.selected_index = initial_stem
+                    .as_ref()
+                    .and_then(|stem| {
+                        this.delegate
+                            .matches
+                            .iter()
+                            .position(|m| this.delegate.candidates.get(m.candidate_id) == Some(stem))
+                    })
+                    .unwrap_or(0);
+                cx.notify();
+            })
+            .ok();
+        })
+    }
+
+    fn confirm(&mut self, _secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        let Some(stem) = self.stem_at(self.selected_index) else {
+            return;
+        };
+        self.modal
+            .update(cx, |modal, cx| modal.confirm(stem, window, cx))
+            .ok();
+    }
+
+    fn dismissed(&mut self, _: &mut Window, cx: &mut Context<Picker<Self>>) {
+        self.modal.update(cx, |_, cx| cx.emit(DismissEvent)).ok();
+    }
+
+    fn render_match(
+        &self,
+        ix: usize,
+        selected: bool,
+        _: &mut Window,
+        _: &mut Context<Picker<Self>>,
+    ) -> Option<Self::ListItem> {
+        let stem = self.stem_at(ix)?;
+        Some(
+            ListItem::new(ix)
+                .inset(true)
+                .spacing(ListItemSpacing::Sparse)
+                .toggle_state(selected)
+                .child(Label::new(stem)),
         )
     }
 }
