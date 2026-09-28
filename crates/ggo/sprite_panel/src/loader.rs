@@ -211,6 +211,40 @@ pub fn compose_reference_strip(state: &SpriteState, sheet: &ReferenceSheet) -> O
     })
 }
 
+/// The sprite's bound tileset pool as one RGBA image, raw pixels rather
+/// than a [`gpui::RenderImage`] -- [`super::SpritePanel::remote_tileset_image`]'s
+/// MCP tool hands them straight to a PNG encoder outside gpui. EVERY pool
+/// tile in pool-index order, BLANKS INCLUDED (unlike [`compose_pool_strip`]'s
+/// picker sheet, which hides them as a UI convenience): an agent asking
+/// "what tiles does this pool hold" wants the whole thing. `cols` tiles
+/// wide. `None` only for an empty pool.
+pub fn compose_pool_image(state: &SpriteState, cols: usize) -> Option<(Vec<u8>, u32, u32)> {
+    if state.tile_count == 0 {
+        return None;
+    }
+    let indices = unpack_til_to_indices(&state.pool, state.tile_count);
+    let (grid, w, h) = compose_tile_grid(&indices, state.tile_count, cols.max(1));
+    let rgba = indices_to_rgba(&grid, &state.palette);
+    Some((rgba, w as u32, h as u32))
+}
+
+/// [`compose_reference_strip`]'s raw-pixel counterpart, for
+/// [`super::SpritePanel::remote_reference_sheet`]'s MCP tool.
+pub fn compose_reference_image(state: &SpriteState, sheet: &ReferenceSheet) -> Option<(Vec<u8>, u32, u32)> {
+    if !sheet.is_valid_for(state.tile_count) {
+        return None;
+    }
+    let indices = unpack_til_to_indices(&state.pool, state.tile_count);
+    let mut shown = Vec::with_capacity(sheet.tiles.len() * TILE_PIXELS);
+    for &t in &sheet.tiles {
+        let off = t as usize * TILE_PIXELS;
+        shown.extend_from_slice(&indices[off..off + TILE_PIXELS]);
+    }
+    let (grid, w, h) = compose_tile_grid(&shown, sheet.tiles.len(), sheet.cols);
+    let rgba = indices_to_rgba(&grid, &state.palette);
+    Some((rgba, w as u32, h as u32))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

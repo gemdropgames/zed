@@ -175,6 +175,63 @@ const FRAME_SETTINGS_MAX_HEIGHT: Pixels = px(480.);
 /// slowing playback down.
 const TICK: Duration = Duration::from_millis(16);
 
+/// How many tiles wide [`SpritePanel::remote_tileset_image`] lays the
+/// pool out. A layout constant like [`loader::PICKER_COLS`], not a
+/// property of the asset -- fixed rather than following the panel's own
+/// (session-only, per-sprite) picker width, so the MCP tool's image
+/// shape never depends on what a human last dragged it to.
+const TILESET_IMAGE_COLS: usize = 16;
+
+/// A clip named either by its index or by its (unique) name -- accepted
+/// by [`SpritePanel::remote_clip_update`]/[`SpritePanel::remote_clip_delete`].
+/// Kept independent of `ggo_emu_remote`'s wire `ClipRef` DTO (this crate
+/// has no dependency on it): `ggo_emu_panel::agent_remote` converts.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClipLookup {
+    Index(usize),
+    Name(String),
+}
+
+/// `sprite_read`/`sprite_clip_create`/`sprite_clip_update`'s clip shape:
+/// `{index, name, loop, entries}`.
+fn remote_clip_json(index: usize, clip: &ClipEdit) -> serde_json::Value {
+    let entries: Vec<serde_json::Value> = clip.entries.iter().map(remote_entry_json).collect();
+    serde_json::json!({
+        "index": index,
+        "name": clip.name,
+        "loop": clip.loop_,
+        "entries": entries,
+    })
+}
+
+/// One clip entry's wire shape. `transform` is included only when it
+/// isn't the identity -- cheap to check, and otherwise every plain entry
+/// would carry five extra numbers that say nothing.
+fn remote_entry_json(entry: &ClipEntry) -> serde_json::Value {
+    let mut json = serde_json::json!({
+        "frame": entry.frame,
+        "duration_ms": entry.duration_ms,
+        "flip_h": entry.flip_h,
+        "flip_v": entry.flip_v,
+        "offset": [entry.offset.0, entry.offset.1],
+    });
+    if !entry.transform.is_identity()
+        && let Some(object) = json.as_object_mut()
+    {
+        object.insert(
+            "transform".to_string(),
+            serde_json::json!({
+                "angle256": entry.transform.angle256,
+                "sx": entry.transform.sx,
+                "sy": entry.transform.sy,
+                "shear_x": entry.transform.shear_x,
+                "shear_y": entry.transform.shear_y,
+            }),
+        );
+    }
+    json
+}
+
 pub fn init(cx: &mut App) {
     // Explorer-driven routing: clicking a `.spr` in the project panel loads
     // it HERE instead of opening a (binary, unreadable) editor tab. This is
@@ -2680,6 +2737,250 @@ impl SpritePanel {
         } else {
             cx.notify();
         }
+    }
+
+    // ------------------------------------------------------------ agent socket
+
+    /// Every `.spr` in the project, `(stem, worktree-relative path)`.
+    /// Sprites carry no separate asset root the way worlds can (F4 X1:
+    /// the file explorer IS the picker), so `list_sprites`' rels are
+    /// already worktree-relative -- no `worktree_rel` translation needed.
+    pub fn remote_list(&mut self, cx: &mut Context<Self>) -> Vec<(String, String)> {
+        self.refresh_root(cx);
+        let Some(root) = self.project_root.clone() else {
+            return Vec::new();
+        };
+        io::list_sprites(&root)
+            .into_iter()
+            .map(|rel| {
+                let stem = Path::new(&rel)
+                    .with_extension("")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                (stem, rel)
+            })
+            .collect()
+    }
+
+    /// The listing entry `sprite` names -- a stem or a rel path -- as the
+    /// rel to open, or the reason there is none.
+    pub fn remote_resolve(&mut self, sprite: &str, cx: &mut Context<Self>) -> Result<String, String> {
+        let sprites = self.remote_list(cx);
+        sprites
+            .iter()
+            .find(|(stem, rel)| stem == sprite || rel == sprite)
+            .map(|(_, rel)| rel.clone())
+            .ok_or_else(|| {
+                let stems: Vec<&str> = sprites.iter().map(|(s, _)| s.as_str()).collect();
+                format!("no sprite {sprite}; the project has {stems:?}")
+            })
+    }
+
+    /// The open sprite as authored: bound tileset, frame footprint,
+    /// clips -- `sprite_read`'s shape.
+    pub fn remote_read(&self) -> Result<serde_json::Value, String> {
+        let ViewerState::Ready(open) = &self.state else {
+            return Err("no sprite open — sprite_open first".to_string());
+        };
+        let state = open.store.state();
+        let stem = |rel: &str| Path::new(rel).with_extension("").to_string_lossy().replace('\\', "/");
+        let clips: Vec<serde_json::Value> = state
+            .clips
+            .iter()
+            .enumerate()
+            .map(|(index, clip)| remote_clip_json(index, clip))
+            .collect();
+        Ok(serde_json::json!({
+            "stem": stem(&open.source_rel),
+            "rel_path": open.source_rel,
+            "dirty": open.store.dirty(),
+            "tileset": { "stem": stem(&open.til_path), "rel_path": open.til_path },
+            "frame_count": state.frames.len(),
+            "frame_size": {
+                "tiles": [state.w_tiles, state.h_tiles],
+                "pixels": [
+                    u32::from(state.w_tiles) * ggo_worldlib::sprites::tileset_doc::TILE_PX as u32,
+                    u32::from(state.h_tiles) * ggo_worldlib::sprites::tileset_doc::TILE_PX as u32,
+                ],
+            },
+            "clips": clips,
+        }))
+    }
+
+    /// `apply_doc`, surfacing the rejection `apply_doc` itself only
+    /// stashes in `open.op_error` -- the MCP tool has no inline error UI
+    /// to show that in, so its caller gets the message back directly.
+    fn apply_doc_checked(&mut self, op: DocOp, cx: &mut Context<Self>) -> Result<(), String> {
+        if self.apply_doc(op, cx) {
+            return Ok(());
+        }
+        match &self.state {
+            ViewerState::Ready(open) => {
+                Err(open.op_error.clone().unwrap_or_else(|| "doc op rejected".to_string()))
+            }
+            _ => Err("no sprite open — sprite_open first".to_string()),
+        }
+    }
+
+    /// `sprite_clip_create`: append a clip (`DocOp::ClipAdd`), returning
+    /// its index and `sprite_read`-shape clip JSON. Leaves the document
+    /// dirty -- `remote_save` persists it.
+    pub fn remote_clip_create(
+        &mut self,
+        name: String,
+        loop_: bool,
+        entries: Vec<ClipEntry>,
+        cx: &mut Context<Self>,
+    ) -> Result<serde_json::Value, String> {
+        if !matches!(self.state, ViewerState::Ready(_)) {
+            return Err("no sprite open — sprite_open first".to_string());
+        }
+        self.apply_doc_checked(DocOp::ClipAdd { clip: ClipEdit { name, loop_, entries } }, cx)?;
+        let ViewerState::Ready(open) = &self.state else {
+            unreachable!("checked Ready above and apply_doc_checked never leaves it");
+        };
+        let index = open.store.state().clips.len() - 1;
+        Ok(remote_clip_json(index, &open.store.state().clips[index]))
+    }
+
+    /// Resolve a [`ClipLookup`] against the open sprite's clips: an index
+    /// out of range, or a name that is missing or shared by more than one
+    /// clip (ambiguous -- the caller is asked for an index instead), is
+    /// an error.
+    fn resolve_clip(&self, clip: &ClipLookup) -> Result<usize, String> {
+        let ViewerState::Ready(open) = &self.state else {
+            return Err("no sprite open — sprite_open first".to_string());
+        };
+        let clips = &open.store.state().clips;
+        match clip {
+            ClipLookup::Index(i) => {
+                if *i < clips.len() {
+                    Ok(*i)
+                } else {
+                    Err(format!("clip {i} out of range (have {})", clips.len()))
+                }
+            }
+            ClipLookup::Name(name) => {
+                let matches: Vec<usize> = clips
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| &c.name == name)
+                    .map(|(i, _)| i)
+                    .collect();
+                match matches[..] {
+                    [] => Err(format!("no clip named {name:?}")),
+                    [i] => Ok(i),
+                    _ => Err(format!(
+                        "{} clips are named {name:?} ({matches:?}) — pass an index",
+                        matches.len()
+                    )),
+                }
+            }
+        }
+    }
+
+    /// `sprite_clip_update`: merge `name`/`loop_`/`entries` (each `None`
+    /// keeps the clip's current value) into the resolved clip via
+    /// `DocOp::ClipSet`. Leaves the document dirty -- `remote_save`
+    /// persists it.
+    pub fn remote_clip_update(
+        &mut self,
+        clip: ClipLookup,
+        name: Option<String>,
+        loop_: Option<bool>,
+        entries: Option<Vec<ClipEntry>>,
+        cx: &mut Context<Self>,
+    ) -> Result<serde_json::Value, String> {
+        let at = self.resolve_clip(&clip)?;
+        let ViewerState::Ready(open) = &self.state else {
+            return Err("no sprite open — sprite_open first".to_string());
+        };
+        let current = open.store.state().clips[at].clone();
+        let merged = ClipEdit {
+            name: name.unwrap_or(current.name),
+            loop_: loop_.unwrap_or(current.loop_),
+            entries: entries.unwrap_or(current.entries),
+        };
+        self.apply_doc_checked(DocOp::ClipSet { at, clip: Some(merged) }, cx)?;
+        let ViewerState::Ready(open) = &self.state else {
+            unreachable!("checked Ready above and apply_doc_checked never leaves it");
+        };
+        Ok(remote_clip_json(at, &open.store.state().clips[at]))
+    }
+
+    /// `sprite_clip_delete`: resolve `clip`, then the same
+    /// `DocOp::ClipSet { clip: None }` + active-clip bookkeeping the
+    /// inline delete button's [`Self::delete_clip_now`] uses (reused, not
+    /// duplicated). Leaves the document dirty -- `remote_save` persists
+    /// it.
+    pub fn remote_clip_delete(
+        &mut self,
+        clip: ClipLookup,
+        cx: &mut Context<Self>,
+    ) -> Result<serde_json::Value, String> {
+        let at = self.resolve_clip(&clip)?;
+        let ViewerState::Ready(open) = &self.state else {
+            return Err("no sprite open — sprite_open first".to_string());
+        };
+        let name = open.store.state().clips[at].name.clone();
+        let next_active = edits::active_clip_after_clip_delete(open.active_clip, at);
+        self.apply_doc_checked(DocOp::ClipSet { at, clip: None }, cx)?;
+        if let ViewerState::Ready(open) = &mut self.state {
+            open.active_clip = next_active;
+        }
+        Ok(serde_json::json!({ "index": at, "name": name }))
+    }
+
+    /// `sprite_save`: the same fold-back save the editor's own Save
+    /// button uses, reporting the rel it wrote or the reason it did not.
+    pub fn remote_save(&mut self, cx: &mut Context<Self>) -> Result<String, String> {
+        if !matches!(self.state, ViewerState::Ready(_)) {
+            return Err("no sprite open — sprite_open first".to_string());
+        }
+        self.save_impl(cx);
+        let ViewerState::Ready(open) = &self.state else {
+            return Err("no sprite open — sprite_open first".to_string());
+        };
+        match &open.save_error {
+            Some(e) => Err(e.clone()),
+            None => Ok(open.source_rel.clone()),
+        }
+    }
+
+    /// `sprite_reference_sheet`: the bound tileset's recorded reference
+    /// sheet composed to raw BGRA pixels (source artwork in its original
+    /// layout), plus the sheet's own `{cols, rows, tiles}`. `Err` when no
+    /// sheet was ever recorded for this tileset, or it no longer fits the
+    /// pool (a re-import, a manual dedup).
+    pub fn remote_reference_sheet(
+        &self,
+    ) -> Result<(u32, u32, Vec<u8>, reference_sheet::ReferenceSheet), String> {
+        let ViewerState::Ready(open) = &self.state else {
+            return Err("no sprite open — sprite_open first".to_string());
+        };
+        let sheet = open
+            .reference
+            .clone()
+            .ok_or_else(|| "no reference sheet recorded for this sprite's tileset".to_string())?;
+        let state = open.store.state();
+        let (mut rgba, width, height) = loader::compose_reference_image(state, &sheet)
+            .ok_or_else(|| "the reference sheet no longer fits the tileset's pool".to_string())?;
+        ggo_common::rgba_to_bgra(&mut rgba);
+        Ok((width, height, rgba, sheet))
+    }
+
+    /// `sprite_tileset_image`: the sprite's bound tileset pool as ONE
+    /// BGRA image, every pool tile (blanks included) in pool-index order,
+    /// [`TILESET_IMAGE_COLS`] tiles wide.
+    pub fn remote_tileset_image(&self) -> Result<(u32, u32, Vec<u8>), String> {
+        let ViewerState::Ready(open) = &self.state else {
+            return Err("no sprite open — sprite_open first".to_string());
+        };
+        let state = open.store.state();
+        let (mut rgba, width, height) = loader::compose_pool_image(state, TILESET_IMAGE_COLS)
+            .ok_or_else(|| "the sprite's tileset pool is empty".to_string())?;
+        ggo_common::rgba_to_bgra(&mut rgba);
+        Ok((width, height, rgba))
     }
 
     // --------------------------------------------------------- frame ops
@@ -11456,6 +11757,222 @@ mod tests {
             before,
             "nothing was written"
         );
+    }
+
+    // ------------------------------------------------------ agent socket
+
+    #[gpui::test]
+    async fn test_remote_list_and_resolve_the_projects_sprites(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        assert_eq!(
+            panel.update(cx, |panel, cx| panel.remote_list(cx)),
+            vec![("sprites/hero".to_string(), "sprites/hero.spr".to_string())]
+        );
+        assert_eq!(
+            panel.update(cx, |panel, cx| panel.remote_resolve("sprites/hero", cx)),
+            Ok("sprites/hero.spr".to_string())
+        );
+        assert_eq!(
+            panel.update(cx, |panel, cx| panel.remote_resolve("sprites/hero.spr", cx)),
+            Ok("sprites/hero.spr".to_string())
+        );
+        assert!(
+            panel
+                .update(cx, |panel, cx| panel.remote_resolve("nope", cx))
+                .unwrap_err()
+                .contains("sprites/hero")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_remote_read_reports_tileset_frame_footprint_and_clips(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        let read = panel.read_with(cx, |panel, _| panel.remote_read()).unwrap();
+        assert_eq!(read["stem"], serde_json::json!("sprites/hero"));
+        assert_eq!(read["rel_path"], serde_json::json!("sprites/hero.spr"));
+        assert_eq!(read["dirty"], serde_json::json!(false));
+        assert_eq!(read["tileset"]["rel_path"], serde_json::json!("sprites/hero.til"));
+        assert_eq!(read["tileset"]["stem"], serde_json::json!("sprites/hero"));
+        assert_eq!(read["frame_count"], serde_json::json!(2));
+        assert_eq!(read["frame_size"]["tiles"], serde_json::json!([1, 1]));
+        assert_eq!(
+            read["frame_size"]["pixels"],
+            serde_json::json!([TILE_PX as u32, TILE_PX as u32])
+        );
+        let clips = read["clips"].as_array().unwrap();
+        assert_eq!(clips.len(), 1);
+        assert_eq!(clips[0]["index"], serde_json::json!(0));
+        assert_eq!(clips[0]["name"], serde_json::json!("walk"));
+        assert_eq!(clips[0]["loop"], serde_json::json!(false));
+        let entries = clips[0]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["frame"], serde_json::json!(0));
+        assert_eq!(entries[0]["duration_ms"], serde_json::json!(100));
+        assert!(
+            entries[0].get("transform").is_none(),
+            "an identity transform is omitted"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_remote_clip_create_update_and_delete_round_trip(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        let created = panel
+            .update(cx, |panel, cx| {
+                panel.remote_clip_create("run".to_string(), true, vec![ClipEntry::of_frame(1)], cx)
+            })
+            .unwrap();
+        assert_eq!(created["index"], serde_json::json!(1));
+        assert_eq!(created["name"], serde_json::json!("run"));
+        assert_eq!(created["loop"], serde_json::json!(true));
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert!(open.store.dirty(), "a clip create leaves the doc dirty");
+            assert_eq!(open.store.state().clips.len(), 2);
+        });
+
+        let err = panel
+            .update(cx, |panel, cx| {
+                panel.remote_clip_create(
+                    "bad".to_string(),
+                    false,
+                    vec![ClipEntry::of_frame(99)],
+                    cx,
+                )
+            })
+            .unwrap_err();
+        assert!(err.contains("99"), "{err}");
+
+        let updated = panel
+            .update(cx, |panel, cx| {
+                panel.remote_clip_update(
+                    ClipLookup::Name("run".to_string()),
+                    Some("sprint".to_string()),
+                    None,
+                    None,
+                    cx,
+                )
+            })
+            .unwrap();
+        assert_eq!(updated["name"], serde_json::json!("sprint"));
+        assert_eq!(updated["loop"], serde_json::json!(true), "an omitted field keeps its value");
+
+        let missing_name = panel.update(cx, |panel, cx| {
+            panel.remote_clip_update(ClipLookup::Name("nope".to_string()), None, None, None, cx)
+        });
+        assert!(missing_name.unwrap_err().contains("nope"));
+
+        let deleted = panel
+            .update(cx, |panel, cx| {
+                panel.remote_clip_delete(ClipLookup::Index(0), cx)
+            })
+            .unwrap();
+        assert_eq!(deleted["index"], serde_json::json!(0));
+        panel.read_with(cx, |panel, _| {
+            let ViewerState::Ready(open) = &panel.state else {
+                panic!("expected Ready");
+            };
+            assert_eq!(open.store.state().clips.len(), 1);
+            assert_eq!(open.store.state().clips[0].name, "sprint");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_remote_clip_update_name_ambiguity_asks_for_an_index(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel
+            .update(cx, |panel, cx| {
+                panel.remote_clip_create("walk".to_string(), false, vec![ClipEntry::of_frame(0)], cx)
+            })
+            .unwrap();
+
+        let ambiguous = panel.update(cx, |panel, cx| {
+            panel.remote_clip_update(ClipLookup::Name("walk".to_string()), None, None, None, cx)
+        });
+        let err = ambiguous.unwrap_err();
+        assert!(err.contains("index"), "{err}");
+    }
+
+    #[gpui::test]
+    async fn test_remote_save_persists_and_clears_dirty(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel
+            .update(cx, |panel, cx| {
+                panel.remote_clip_create("run".to_string(), false, vec![ClipEntry::of_frame(1)], cx)
+            })
+            .unwrap();
+        assert!(panel.read_with(cx, |panel, _| matches!(
+            &panel.state,
+            ViewerState::Ready(open) if open.store.dirty()
+        )));
+
+        let saved = panel.update(cx, |panel, cx| panel.remote_save(cx)).unwrap();
+        assert_eq!(saved, "sprites/hero.spr");
+        assert!(panel.read_with(cx, |panel, _| matches!(
+            &panel.state,
+            ViewerState::Ready(open) if !open.store.dirty()
+        )));
+        let reopened = open_sprite(dir.path(), "sprites/hero.spr").unwrap();
+        assert_eq!(reopened.state.clips.len(), 2, "the save reached disk");
+    }
+
+    #[gpui::test]
+    async fn test_remote_reference_sheet_errors_when_absent_and_returns_image_when_present(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let err = panel
+            .read_with(cx, |panel, _| panel.remote_reference_sheet())
+            .unwrap_err();
+        assert!(err.contains("reference"), "{err}");
+
+        reference_sheet::save(
+            dir.path(),
+            "sprites/hero.til",
+            &reference_sheet::ReferenceSheet {
+                cols: 2,
+                rows: 1,
+                tiles: vec![0, 1],
+            },
+        )
+        .unwrap();
+        panel.update(cx, |panel, cx| panel.load_rel_path("sprites/hero.spr", cx));
+        cx.executor().run_until_parked();
+
+        let (width, height, bgra, sheet) = panel
+            .read_with(cx, |panel, _| panel.remote_reference_sheet())
+            .unwrap();
+        assert_eq!((width, height), (2 * TILE_PX as u32, TILE_PX as u32));
+        assert_eq!(bgra.len(), (width * height * 4) as usize);
+        assert_eq!(sheet.cols, 2);
+        assert_eq!(sheet.tiles, vec![0, 1]);
+    }
+
+    #[gpui::test]
+    async fn test_remote_tileset_image_is_the_full_pool_row_major(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        let (width, height, bgra) = panel
+            .read_with(cx, |panel, _| panel.remote_tileset_image())
+            .unwrap();
+        // The fixture's 2-tile pool is narrower than the fixed 16-wide
+        // grid, so it lands on one row, padded out to the full width.
+        assert_eq!(
+            (width, height),
+            (TILESET_IMAGE_COLS as u32 * TILE_PX as u32, TILE_PX as u32)
+        );
+        assert_eq!(bgra.len(), (width * height * 4) as usize);
     }
 
     /// "Don't Save" closes the tab and deliberately drops the edits.
