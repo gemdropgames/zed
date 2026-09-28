@@ -152,6 +152,105 @@ pub enum Cmd {
         #[serde(default)]
         full: bool,
     },
+    /// Every `.spr` file in the project: `[{stem, rel_path}]`.
+    SpriteList { workspace: Option<String> },
+    /// Open `sprite` (stem or rel path) as an editor tab, focusing an
+    /// already-open tab instead of reloading it; the reply names the rel
+    /// path that opened.
+    SpriteOpen {
+        workspace: Option<String>,
+        sprite: String,
+    },
+    /// The open sprite as authored: bound tileset, frame footprint,
+    /// clips. With `sprite`, opens it first.
+    SpriteRead {
+        workspace: Option<String>,
+        #[serde(default)]
+        sprite: Option<String>,
+    },
+    /// Append a clip to `sprite`'s document (`DocOp::ClipAdd`). Leaves
+    /// the document dirty; `SpriteSave` persists it.
+    SpriteClipCreate {
+        workspace: Option<String>,
+        sprite: String,
+        name: String,
+        #[serde(default, rename = "loop")]
+        loop_: bool,
+        #[serde(default)]
+        entries: Vec<ClipEntryArg>,
+    },
+    /// Merge fields into an existing clip (`DocOp::ClipSet`). `clip` is
+    /// an index or a name; an ambiguous name errors, asking for an
+    /// index. Leaves the document dirty; `SpriteSave` persists it.
+    SpriteClipUpdate {
+        workspace: Option<String>,
+        sprite: String,
+        clip: ClipRef,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default, rename = "loop")]
+        loop_: Option<bool>,
+        #[serde(default)]
+        entries: Option<Vec<ClipEntryArg>>,
+    },
+    /// Delete a clip (`DocOp::ClipSet` with `clip: None`). Leaves the
+    /// document dirty; `SpriteSave` persists it.
+    SpriteClipDelete {
+        workspace: Option<String>,
+        sprite: String,
+        clip: ClipRef,
+    },
+    /// Save the open sprite's unsaved edits.
+    SpriteSave {
+        workspace: Option<String>,
+        sprite: String,
+    },
+    /// The bound tileset's import-time reference sheet: the source
+    /// artwork in its original layout (poses, facing, sequence order) --
+    /// the thing to look at when creating or editing clips. `path` also
+    /// writes the PNG to disk (absolute, or relative to the workspace
+    /// root).
+    SpriteReferenceSheet {
+        workspace: Option<String>,
+        sprite: String,
+        #[serde(default)]
+        path: Option<String>,
+    },
+    /// The sprite's bound tileset pool as a fixed-width grid, pool-index
+    /// order. `path` also writes the PNG to disk.
+    SpriteTilesetImage {
+        workspace: Option<String>,
+        sprite: String,
+        #[serde(default)]
+        path: Option<String>,
+    },
+}
+
+/// A clip named either by its index or by its (unique) name -- accepted
+/// by [`Cmd::SpriteClipUpdate`]/[`Cmd::SpriteClipDelete`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ClipRef {
+    Index(usize),
+    Name(String),
+}
+
+/// One `sprite_clip_create`/`sprite_clip_update` entry argument -- a
+/// plain DTO mirroring `ggo_worldlib::sprites::cow::ClipEntry`. This
+/// crate carries no dependency on worldlib, so the emu_panel-side
+/// handler converts; `duration_ms`/`offset` default to the store's own
+/// per-entry defaults (`None` here, not zero) when omitted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClipEntryArg {
+    pub frame: usize,
+    #[serde(default)]
+    pub duration_ms: Option<u16>,
+    #[serde(default)]
+    pub flip_h: bool,
+    #[serde(default)]
+    pub flip_v: bool,
+    #[serde(default)]
+    pub offset: Option<(i16, i16)>,
 }
 
 /// Which PPU inspector view `Cmd::Debug` renders.
@@ -814,6 +913,148 @@ mod tests {
                 workspace: None,
                 world: Some("worlds/a".to_string()),
                 full: true
+            }
+        );
+    }
+
+    #[test]
+    fn sprite_requests_round_trip() {
+        assert_eq!(
+            parse_request(r#"{"id":1,"cmd":"sprite_list"}"#).unwrap().cmd,
+            Cmd::SpriteList { workspace: None }
+        );
+        assert_eq!(
+            parse_request(r#"{"id":2,"cmd":"sprite_open","sprite":"sprites/hero"}"#)
+                .unwrap()
+                .cmd,
+            Cmd::SpriteOpen {
+                workspace: None,
+                sprite: "sprites/hero".to_string()
+            }
+        );
+        assert_eq!(
+            parse_request(r#"{"id":3,"cmd":"sprite_read"}"#).unwrap().cmd,
+            Cmd::SpriteRead {
+                workspace: None,
+                sprite: None
+            }
+        );
+    }
+
+    #[test]
+    fn sprite_clip_create_parses_entries_and_defaults_loop_and_optionals() {
+        let req = parse_request(
+            r#"{"id":1,"cmd":"sprite_clip_create","sprite":"hero","name":"walk",
+                "entries":[{"frame":0},{"frame":1,"duration_ms":80,"flip_h":true,"offset":[1,-1]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req.cmd,
+            Cmd::SpriteClipCreate {
+                workspace: None,
+                sprite: "hero".to_string(),
+                name: "walk".to_string(),
+                loop_: false,
+                entries: vec![
+                    ClipEntryArg {
+                        frame: 0,
+                        duration_ms: None,
+                        flip_h: false,
+                        flip_v: false,
+                        offset: None,
+                    },
+                    ClipEntryArg {
+                        frame: 1,
+                        duration_ms: Some(80),
+                        flip_h: true,
+                        flip_v: false,
+                        offset: Some((1, -1)),
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn sprite_clip_create_accepts_the_loop_keyword_field() {
+        let req = parse_request(
+            r#"{"id":1,"cmd":"sprite_clip_create","sprite":"hero","name":"walk","loop":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req.cmd,
+            Cmd::SpriteClipCreate {
+                workspace: None,
+                sprite: "hero".to_string(),
+                name: "walk".to_string(),
+                loop_: true,
+                entries: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn sprite_clip_update_and_delete_accept_an_index_or_a_name_for_clip() {
+        assert_eq!(
+            parse_request(
+                r#"{"id":1,"cmd":"sprite_clip_update","sprite":"hero","clip":2,"name":"run"}"#
+            )
+            .unwrap()
+            .cmd,
+            Cmd::SpriteClipUpdate {
+                workspace: None,
+                sprite: "hero".to_string(),
+                clip: ClipRef::Index(2),
+                name: Some("run".to_string()),
+                loop_: None,
+                entries: None,
+            }
+        );
+        assert_eq!(
+            parse_request(
+                r#"{"id":2,"cmd":"sprite_clip_delete","sprite":"hero","clip":"walk"}"#
+            )
+            .unwrap()
+            .cmd,
+            Cmd::SpriteClipDelete {
+                workspace: None,
+                sprite: "hero".to_string(),
+                clip: ClipRef::Name("walk".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn sprite_save_and_image_requests_round_trip() {
+        assert_eq!(
+            parse_request(r#"{"id":1,"cmd":"sprite_save","sprite":"hero"}"#)
+                .unwrap()
+                .cmd,
+            Cmd::SpriteSave {
+                workspace: None,
+                sprite: "hero".to_string()
+            }
+        );
+        assert_eq!(
+            parse_request(r#"{"id":2,"cmd":"sprite_reference_sheet","sprite":"hero"}"#)
+                .unwrap()
+                .cmd,
+            Cmd::SpriteReferenceSheet {
+                workspace: None,
+                sprite: "hero".to_string(),
+                path: None,
+            }
+        );
+        assert_eq!(
+            parse_request(
+                r#"{"id":3,"cmd":"sprite_tileset_image","sprite":"hero","path":"/tmp/x.png"}"#
+            )
+            .unwrap()
+            .cmd,
+            Cmd::SpriteTilesetImage {
+                workspace: None,
+                sprite: "hero".to_string(),
+                path: Some("/tmp/x.png".to_string()),
             }
         );
     }
