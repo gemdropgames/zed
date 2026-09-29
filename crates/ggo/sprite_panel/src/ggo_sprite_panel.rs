@@ -1768,14 +1768,14 @@ impl OpenSprite {
         Some(image)
     }
 
-    /// Whether what the preview shows renders through the legacy
-    /// identity path -- the only case the preview's tile grid and
-    /// cell-click editing are geometrically meaningful in (the
-    /// transformed canvas is doubled and rotated, so cell math over it
-    /// would stamp the wrong tiles).
-    fn shown_frame_is_identity(&self) -> bool {
-        let shown = self.shown();
-        shown.transform.is_identity() && shown.flip == (false, false)
+    /// Whether the preview is footprint-sized, so its tile grid and
+    /// cell-click editing are geometrically meaningful: any identity
+    /// transform, flipped or not (a flip only mirrors the cells --
+    /// `preview_cell_at` maps clicks back through it). A transformed
+    /// canvas is doubled and rotated; cell math over it would stamp the
+    /// wrong tiles.
+    fn shown_frame_has_tile_grid(&self) -> bool {
+        self.shown().transform.is_identity()
     }
 }
 
@@ -3907,19 +3907,23 @@ impl SpritePanel {
         // A transformed frame's preview is the doubled, rotated canvas:
         // the cell math below would land on the wrong tiles, so clicks
         // there edit nothing (the click still pauses playback/focuses).
-        if !open.shown_frame_is_identity() {
+        if !open.shown_frame_has_tile_grid() {
             return None;
         }
         let bounds = (*open.preview_bounds.borrow())?;
         let state = open.store.state();
-        tiles::cell_at(
+        let (w_tiles, h_tiles) = (state.w_tiles as usize, state.h_tiles as usize);
+        let shown = tiles::cell_at(
             f32::from(position.x - bounds.origin.x),
             f32::from(position.y - bounds.origin.y),
             f32::from(bounds.size.width),
             f32::from(bounds.size.height),
-            state.w_tiles as usize,
-            state.h_tiles as usize,
-        )
+            w_tiles,
+            h_tiles,
+        )?;
+        // A flipped preview shows the frame mirrored: the displayed cell
+        // maps back to the mirrored frame cell.
+        Some(tiles::flip_cell(shown, w_tiles, h_tiles, open.shown().flip))
     }
 
     // ---------------------------------------------------------- clip ops
@@ -4574,7 +4578,7 @@ impl SpritePanel {
         // suppressed -- the doubled, rotated canvas has no meaningful
         // cell geometry (clicks are guarded the same way in
         // `preview_cell_at`).
-        let show_grid = open.shown_frame_is_identity();
+        let show_grid = open.shown_frame_has_tile_grid();
         if let Some(image) = open.preview_image() {
             let (w, h) = image_px_size(&image);
             let state = open.store.state();
@@ -8525,6 +8529,30 @@ mod tests {
 
     /// The entry settings fields commit onto the SELECTED entry, and none
     /// of them touches the frame library.
+    #[gpui::test]
+    async fn test_flipped_entry_keeps_the_tile_grid_and_cell_clicks(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.select_entry(0, 1, cx);
+            panel.set_entry_flip(0, 1, true, true, cx);
+            assert!(
+                ready(panel).shown_frame_has_tile_grid(),
+                "a flip-only entry is still footprint-sized: grid stays"
+            );
+            *ready(panel).preview_bounds.borrow_mut() = Some(gpui::bounds(
+                gpui::point(px(10.), px(20.)),
+                gpui::size(px(240.), px(240.)),
+            ));
+            assert_eq!(
+                panel.preview_cell_at(gpui::point(px(10.), px(20.))),
+                Some(0),
+                "cell clicks still land on a flipped frame"
+            );
+        });
+    }
+
     #[gpui::test]
     async fn test_entry_settings_commit_flip_offset_and_duration(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
