@@ -21,39 +21,21 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
+use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Render,
     RenderImage, Styled, Task, WeakEntity, Window, div, img, px,
 };
 use picker::{Picker, PickerDelegate};
 use ui::prelude::*;
-use ui::{ListItem, ListItemSpacing, Modal, ModalFooter, ModalHeader, Section};
+use ui::{ListItem, ListItemSpacing};
 use workspace::ModalView;
 
 use crate::{
     NewKind, NewSpriteOutcome, PICKER_CELL_PX, SpritePanel, TilesetChoice, compose_tileset_preview,
 };
+use ggo_common::picker_card::{self, PickerCard};
 use ggo_worldlib::sprites::hw::TILE_PX;
-
-/// The results column's width. `Picker` applies this to itself, so the
-/// card's body row only has to leave the rest to the preview. Rems, not
-/// pixels: `Picker` derives its own minimum width from a rems-based
-/// initial width and silently keeps the default from a pixel one.
-const PICKER_WIDTH: gpui::Rems = gpui::rems(20.);
-
-/// How tall the picker's list is allowed to get before it scrolls.
-const PICKER_MAX_HEIGHT: gpui::Rems = gpui::rems(20.);
-
-/// The card's overall width: the picker column plus a preview column
-/// wide enough for a sheet a few tiles across before it has to scroll.
-const CARD_WIDTH: gpui::Pixels = px(760.);
-
-/// How tall the preview is allowed to get, as a fraction of the window.
-/// Half rather than the usual 70%: the modal layer parks the card 80px
-/// from the top, so a taller body would push the card's footer off a
-/// short window instead of scrolling.
-const PREVIEW_MAX_VH: f32 = 0.5;
 
 pub struct NewSpriteModal {
     panel: WeakEntity<SpritePanel>,
@@ -110,8 +92,8 @@ impl NewSpriteModal {
                 // draw a second elevated surface inside it -- nor dismiss
                 // itself on blur, which is the modal layer's job here.
                 .embedded()
-                .initial_width(PICKER_WIDTH)
-                .max_height(PICKER_MAX_HEIGHT)
+                .initial_width(picker_card::PICKER_WIDTH)
+                .max_height(picker_card::PICKER_MAX_HEIGHT)
         });
         let mut this = Self {
             panel,
@@ -241,23 +223,9 @@ impl NewSpriteModal {
                 .debug_selector(|| "ggo-sprite-new-preview".into())
                 .child(img(image).nearest(true).w(width).h(height))
         });
-        v_flex()
-            .id("ggo-sprite-new-preview-region")
-            .flex_1()
-            .min_w_0()
-            .max_h(vh(PREVIEW_MAX_VH, window))
-            // Both axes: a sheet can outgrow the column either way, and a
-            // scroll container's automatic minimum size is zero, which is
-            // what stops the card growing to fit it.
-            .overflow_scroll()
+        picker_card::preview_region("ggo-sprite-new-preview-region", window)
             .when(sized.is_none(), |this| {
-                this.child(
-                    div().m_auto().child(
-                        Label::new("No preview")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
-                )
+                this.child(picker_card::preview_placeholder("No preview"))
             })
             .children(sized)
     }
@@ -306,68 +274,39 @@ impl Render for NewSpriteModal {
                 ))
                 .into_any_element()
         };
-        let create = has_tilesets.then(|| {
-            div()
-                .debug_selector(|| "ggo-sprite-new-create".into())
-                .child(
-                    Button::new("ggo-sprite-new-create", "Create")
-                        .on_click(cx.listener(|this, _, window, cx| this.create(window, cx))),
-                )
-        });
-        div()
-            .track_focus(&self.focus_handle)
-            .elevation_3(cx)
-            .w(CARD_WIDTH)
-            .child(
-                Modal::new("ggo-sprite-new", None)
-                    .header(
-                        ModalHeader::new()
-                            .headline(format!("{} {}", self.kind.label(), self.name))
-                            // Where it lands. The tab-hosted form said
-                            // this inline ("… in assets/sprites") and it
-                            // is the only thing left that says WHICH
-                            // right-click raised the card.
-                            .description(format!("in {}", self.dir_rel)),
-                    )
-                    .section(
-                        Section::new().child(
-                            v_flex()
-                                .gap_1()
-                                .child(body)
-                                // A WARNING, not an error: binding a
-                                // tileset another sprite owns is legal
-                                // and sometimes wanted, it just has
-                                // consequences for a file the user did
-                                // not open.
-                                .children(share_warning.map(|warning| {
-                                    Label::new(warning)
-                                        .size(LabelSize::Small)
-                                        .color(Color::Warning)
-                                }))
-                                .children(self.error.clone().map(|error| {
-                                    ggo_common::CopyableText::new(
-                                        "ggo-sprite-new-error-copy",
-                                        error,
-                                    )
-                                    .size(LabelSize::Small)
-                                })),
-                        ),
-                    )
-                    .footer(
-                        ModalFooter::new().end_slot(
-                            h_flex()
-                                .gap_1()
-                                .children(create)
-                                .child(
-                                    div()
-                                        .debug_selector(|| "ggo-sprite-new-cancel".into())
-                                        .child(Button::new("ggo-sprite-new-cancel", "Cancel").on_click(
-                                            cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
-                                        )),
-                                ),
-                        ),
-                    ),
-            )
+        PickerCard::new(
+            "ggo-sprite-new",
+            format!("{} {}", self.kind.label(), self.name),
+            // Where it lands. The tab-hosted form said this inline
+            // ("… in assets/sprites") and it is the only thing left that
+            // says WHICH right-click raised the card.
+            format!("in {}", self.dir_rel),
+        )
+        .track_focus(&self.focus_handle)
+        .body(
+            v_flex()
+                .gap_1()
+                .child(body)
+                // A WARNING, not an error: binding a tileset another
+                // sprite owns is legal and sometimes wanted, it just has
+                // consequences for a file the user did not open.
+                .children(share_warning.map(|warning| {
+                    Label::new(warning)
+                        .size(LabelSize::Small)
+                        .color(Color::Warning)
+                }))
+                .children(self.error.clone().map(|error| {
+                    ggo_common::CopyableText::new("ggo-sprite-new-error-copy", error)
+                        .size(LabelSize::Small)
+                })),
+        )
+        .when(has_tilesets, |card| {
+            card.confirm("ggo-sprite-new-create", "Create")
+        })
+        .render(
+            cx.listener(|this, _, window, cx| this.create(window, cx)),
+            cx,
+        )
     }
 }
 
@@ -455,40 +394,17 @@ impl PickerDelegate for TilesetPickerDelegate {
             .map(|(id, choice)| StringMatchCandidate::new(id, &choice.rel))
             .collect();
         cx.spawn_in(window, async move |this, cx| {
-            let matches = if query.is_empty() {
-                candidates
-                    .into_iter()
-                    .map(|candidate| StringMatch {
-                        candidate_id: candidate.id,
-                        string: candidate.string,
-                        positions: Vec::new(),
-                        score: 0.0,
-                    })
-                    .collect()
-            } else {
-                match_strings(
-                    &candidates,
-                    &query,
-                    false,
-                    true,
-                    100,
-                    &Default::default(),
-                    background,
-                )
-                .await
-            };
+            let matches = picker_card::matches_for(candidates, query.clone(), background).await;
             this.update(cx, |this, cx| {
                 this.delegate.matches = matches;
-                // An empty query lists every tileset in listing order, so
-                // the default row ([`crate::default_tileset_choice`])
-                // survives the initial pass unmoved; any other query can
-                // drop it, and the top surviving row takes the highlight.
-                let last = this.delegate.matches.len().saturating_sub(1);
-                this.delegate.selected_index = if query.is_empty() {
-                    this.delegate.selected_index.min(last)
-                } else {
-                    0
-                };
+                // An empty query leaves the default row
+                // ([`crate::default_tileset_choice`]) holding the
+                // highlight it opened on.
+                this.delegate.selected_index = picker_card::reselect_index(
+                    this.delegate.selected_index,
+                    &query,
+                    this.delegate.matches.len(),
+                );
                 this.delegate.publish_highlight(cx);
             })
             .ok();

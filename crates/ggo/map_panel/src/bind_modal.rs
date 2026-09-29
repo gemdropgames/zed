@@ -21,36 +21,20 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
+use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Render,
     RenderImage, Styled, Task, WeakEntity, Window, div, img, px,
 };
 use picker::{Picker, PickerDelegate};
 use ui::prelude::*;
-use ui::{ListItem, ListItemSpacing, Modal, ModalFooter, ModalHeader, Section};
+use ui::{ListItem, ListItemSpacing};
 use workspace::ModalView;
 
+use ggo_common::picker_card::{self, PickerCard};
 use ggo_worldlib::sprites::tileset_doc::TILE_PX;
 
 use crate::loader;
-
-/// The results column's width. Rems rather than pixels: `Picker` derives
-/// its own minimum width from a rems-based initial width and silently
-/// keeps its default from a pixel one.
-const PICKER_WIDTH: gpui::Rems = gpui::rems(20.);
-
-/// How tall the picker's list gets before it scrolls.
-const PICKER_MAX_HEIGHT: gpui::Rems = gpui::rems(20.);
-
-/// The card's overall width: the picker column plus a preview column wide
-/// enough for a sheet a few tiles across before it has to scroll.
-const CARD_WIDTH: gpui::Pixels = px(760.);
-
-/// How tall the preview gets, as a fraction of the window. Half, not the
-/// usual 70%: the modal layer parks the card 80px from the top, so a
-/// taller body pushes the footer off a short window.
-const PREVIEW_MAX_VH: f32 = 0.5;
 
 /// Preview tiles are drawn at this many pixels a side, so a 16px tile
 /// reads at a glance instead of at native size.
@@ -102,8 +86,8 @@ impl BindTilesetModal {
                 // draw a second elevated surface inside it -- nor dismiss
                 // itself on blur, which is the modal layer's job here.
                 .embedded()
-                .initial_width(PICKER_WIDTH)
-                .max_height(PICKER_MAX_HEIGHT)
+                .initial_width(picker_card::PICKER_WIDTH)
+                .max_height(picker_card::PICKER_MAX_HEIGHT)
         });
         let mut this = BindTilesetModal {
             root,
@@ -187,23 +171,9 @@ impl BindTilesetModal {
                 .debug_selector(|| "ggo-map-bind-preview".into())
                 .child(img(image).nearest(true).w(width).h(height))
         });
-        v_flex()
-            .id("ggo-map-bind-preview-region")
-            .flex_1()
-            .min_w_0()
-            .max_h(vh(PREVIEW_MAX_VH, window))
-            // Both axes: a sheet can outgrow the column either way, and a
-            // scroll container's automatic minimum size is zero, which is
-            // what stops the card growing to fit it.
-            .overflow_scroll()
+        picker_card::preview_region("ggo-map-bind-preview-region", window)
             .when(sized.is_none(), |this| {
-                this.child(
-                    div().m_auto().child(
-                        Label::new("No preview")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
-                )
+                this.child(picker_card::preview_placeholder("No preview"))
             })
             .children(sized)
     }
@@ -247,40 +217,19 @@ impl Render for BindTilesetModal {
                 ))
                 .into_any_element()
         };
-        let confirm = has_tilesets.then(|| {
-            div()
-                .debug_selector(|| "ggo-map-bind-confirm".into())
-                .child(
-                    Button::new("ggo-map-bind-confirm", "Bind")
-                        .on_click(cx.listener(|this, _, _, cx| this.confirm(cx))),
-                )
-        });
-        div()
-            .track_focus(&self.focus_handle)
-            .elevation_3(cx)
-            .w(CARD_WIDTH)
-            .child(
-                Modal::new("ggo-map-bind", None)
-                    .header(
-                        ModalHeader::new()
-                            .headline("Bind tileset")
-                            // A rebind re-points every painted cell, so
-                            // the card says so where the choice is made.
-                            .description("The map's cells are tile indices into this sheet"),
-                    )
-                    .section(Section::new().child(body))
-                    .footer(
-                        ModalFooter::new().end_slot(
-                            h_flex().gap_1().children(confirm).child(
-                                div()
-                                    .debug_selector(|| "ggo-map-bind-cancel".into())
-                                    .child(Button::new("ggo-map-bind-cancel", "Cancel").on_click(
-                                        cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
-                                    )),
-                            ),
-                        ),
-                    ),
-            )
+        PickerCard::new(
+            "ggo-map-bind",
+            "Bind tileset",
+            // A rebind re-points every painted cell, so the card says so
+            // where the choice is made.
+            "The map's cells are tile indices into this sheet",
+        )
+        .track_focus(&self.focus_handle)
+        .body(body)
+        .when(has_tilesets, |card| {
+            card.confirm("ggo-map-bind-confirm", "Bind")
+        })
+        .render(cx.listener(|this, _, _, cx| this.confirm(cx)), cx)
     }
 }
 
@@ -350,40 +299,16 @@ impl PickerDelegate for TilesetPickerDelegate {
             .map(|(id, rel)| StringMatchCandidate::new(id, rel))
             .collect();
         cx.spawn_in(window, async move |this, cx| {
-            let matches = if query.is_empty() {
-                candidates
-                    .into_iter()
-                    .map(|candidate| StringMatch {
-                        candidate_id: candidate.id,
-                        string: candidate.string,
-                        positions: Vec::new(),
-                        score: 0.0,
-                    })
-                    .collect()
-            } else {
-                match_strings(
-                    &candidates,
-                    &query,
-                    false,
-                    true,
-                    100,
-                    &Default::default(),
-                    background,
-                )
-                .await
-            };
+            let matches = picker_card::matches_for(candidates, query.clone(), background).await;
             this.update(cx, |this, cx| {
                 this.delegate.matches = matches;
-                // An empty query lists every tileset in listing order, so
-                // the CURRENTLY BOUND row keeps the highlight it opened
-                // on; any other query can drop it, and the top surviving
-                // row takes over.
-                let last = this.delegate.matches.len().saturating_sub(1);
-                this.delegate.selected_index = if query.is_empty() {
-                    this.delegate.selected_index.min(last)
-                } else {
-                    0
-                };
+                // An empty query leaves the CURRENTLY BOUND row holding the
+                // highlight it opened on.
+                this.delegate.selected_index = picker_card::reselect_index(
+                    this.delegate.selected_index,
+                    &query,
+                    this.delegate.matches.len(),
+                );
                 this.delegate.publish_highlight(cx);
             })
             .ok();

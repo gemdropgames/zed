@@ -18,35 +18,24 @@
 
 use std::sync::Arc;
 
-use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
+use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Render,
-    Styled, Task, WeakEntity, Window, div, px,
+    Styled, Task, WeakEntity, Window, px,
 };
 use picker::{Picker, PickerDelegate};
 use ui::prelude::*;
-use ui::{ListItem, ListItemSpacing, Modal, ModalFooter, ModalHeader, Section};
+use ui::{ListItem, ListItemSpacing};
 use workspace::ModalView;
+
+use ggo_common::picker_card::{self, PickerCard};
 
 use crate::EmeraldPanel;
 
-/// The results column's width. Rems, not pixels: `Picker` derives its
-/// own minimum width from a rems-based initial width and silently keeps
-/// the default from a pixel one.
-const PICKER_WIDTH: gpui::Rems = gpui::rems(18.);
-
-/// How tall the picker's list is allowed to get before it scrolls.
-const PICKER_MAX_HEIGHT: gpui::Rems = gpui::rems(20.);
-
-/// The card's overall width: the picker column plus a preview column
-/// wide enough for a qualified `module/name@N` ref.
+/// The card's overall width, narrower than the shared default: this
+/// card's preview is a column of text wide enough for a qualified
+/// `module/name@N` ref, not a tile sheet that has to be shown at size.
 const CARD_WIDTH: gpui::Pixels = px(640.);
-
-/// How tall the preview column is allowed to get, as a fraction of the
-/// window -- half, for the same reason the generate card's body is: the
-/// modal layer parks the card 80px from the top, so a taller column
-/// would push the footer off a short window instead of scrolling.
-const PREVIEW_MAX_VH: f32 = 0.5;
 
 pub struct AddSystemModal {
     panel: WeakEntity<EmeraldPanel>,
@@ -86,8 +75,8 @@ impl AddSystemModal {
                 // draw a second elevated surface inside it -- nor dismiss
                 // itself on blur, which is the modal layer's job here.
                 .embedded()
-                .initial_width(PICKER_WIDTH)
-                .max_height(PICKER_MAX_HEIGHT)
+                .initial_width(picker_card::PICKER_WIDTH)
+                .max_height(picker_card::PICKER_MAX_HEIGHT)
         });
         Self {
             panel,
@@ -136,14 +125,9 @@ impl AddSystemModal {
     fn render_preview(&self, window: &mut Window, cx: &App) -> impl IntoElement {
         let rows = self.preview();
         let appended = self.order.len();
-        v_flex()
-            .id("ggo-emerald-add-system-preview")
+        picker_card::preview_region("ggo-emerald-add-system-preview", window)
             .debug_selector(|| "ggo-emerald-add-system-preview".into())
-            .flex_1()
-            .min_w_0()
             .gap_0p5()
-            .max_h(vh(PREVIEW_MAX_VH, window))
-            .overflow_scroll()
             .border_l_1()
             .border_color(cx.theme().colors().border)
             .pl_2()
@@ -177,49 +161,24 @@ impl ModalView for AddSystemModal {}
 impl Render for AddSystemModal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let preview = self.render_preview(window, cx);
-        div().elevation_3(cx).w(CARD_WIDTH).child(
-            Modal::new("ggo-emerald-add-system", None)
-                .header(
-                    ModalHeader::new()
-                        .headline("Add a system")
-                        .description(format!("to schedule {}", self.schedule)),
-                )
-                .section(
-                    Section::new().child(
-                        h_flex()
-                            .w_full()
-                            .gap_2()
-                            .items_start()
-                            .child(self.picker.clone())
-                            .child(preview),
-                    ),
-                )
-                .footer(
-                    ModalFooter::new().end_slot(
-                        h_flex()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .debug_selector(|| "ggo-emerald-add-system-confirm".into())
-                                    .child(
-                                        Button::new("ggo-emerald-add-system-confirm", "Add")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.confirm(window, cx)
-                                            })),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .debug_selector(|| "ggo-emerald-add-system-cancel".into())
-                                    .child(
-                                        Button::new("ggo-emerald-add-system-cancel", "Cancel")
-                                            .on_click(
-                                                cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
-                                            ),
-                                    ),
-                            ),
-                    ),
-                ),
+        PickerCard::new(
+            "ggo-emerald-add-system",
+            "Add a system",
+            format!("to schedule {}", self.schedule),
+        )
+        .width(CARD_WIDTH)
+        .body(
+            h_flex()
+                .w_full()
+                .gap_2()
+                .items_start()
+                .child(self.picker.clone())
+                .child(preview),
+        )
+        .confirm("ggo-emerald-add-system-confirm", "Add")
+        .render(
+            cx.listener(|this, _, window, cx| this.confirm(window, cx)),
+            cx,
         )
     }
 }
@@ -298,40 +257,14 @@ impl PickerDelegate for SystemPickerDelegate {
             .map(|(id, system_ref)| StringMatchCandidate::new(id, system_ref))
             .collect();
         cx.spawn_in(window, async move |this, cx| {
-            let matches = if query.is_empty() {
-                candidates
-                    .into_iter()
-                    .map(|candidate| StringMatch {
-                        candidate_id: candidate.id,
-                        string: candidate.string,
-                        positions: Vec::new(),
-                        score: 0.0,
-                    })
-                    .collect()
-            } else {
-                match_strings(
-                    &candidates,
-                    &query,
-                    false,
-                    true,
-                    100,
-                    &Default::default(),
-                    background,
-                )
-                .await
-            };
+            let matches = picker_card::matches_for(candidates, query.clone(), background).await;
             this.update(cx, |this, cx| {
                 this.delegate.matches = matches;
-                // An empty query lists every candidate in manifest order,
-                // so a highlight the user moved survives it; any other
-                // query can drop the highlighted row, and the top
-                // surviving row takes over.
-                let last = this.delegate.matches.len().saturating_sub(1);
-                this.delegate.selected_index = if query.is_empty() {
-                    this.delegate.selected_index.min(last)
-                } else {
-                    0
-                };
+                this.delegate.selected_index = picker_card::reselect_index(
+                    this.delegate.selected_index,
+                    &query,
+                    this.delegate.matches.len(),
+                );
                 this.delegate.publish_highlight(cx);
             })
             .ok();

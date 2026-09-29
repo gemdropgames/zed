@@ -37,6 +37,9 @@ use project::ProjectPath;
 use workspace::Workspace;
 use workspace::dock::Panel;
 
+/// The chrome and matching policy the GGO panels' picker cards share.
+pub mod picker_card;
+
 /// Replay a tileset's recorded import from its (changed) source. Lives
 /// here rather than in the import panel so the tileset panel -- which the
 /// import panel depends on -- can dispatch it without a crate cycle.

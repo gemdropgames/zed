@@ -13,6 +13,8 @@ path = "src/ggo_common.rs"
 
 [dependencies]
 async-channel.workspace = true # GGO -- LinkEndpoint's inbound/tick channels
+# GGO -- the shared picker-card matching policy, see `picker_card`.
+fuzzy.workspace = true
 log.workspace = true
 settings.workspace = true # GGO -- `bind_default_keymap` for panel tests
 ggo-wire.workspace = true # GGO -- LinkEndpoint::send_app frames CHANNEL_APP

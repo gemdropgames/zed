@@ -21,16 +21,17 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
+use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Render,
     RenderImage, Styled, Task, WeakEntity, Window, div, img, px,
 };
 use picker::{Picker, PickerDelegate};
 use ui::prelude::*;
-use ui::{ListItem, ListItemSpacing, Modal, ModalFooter, ModalHeader, Section};
+use ui::{ListItem, ListItemSpacing};
 use workspace::ModalView;
 
+use ggo_common::picker_card::{self, PickerCard};
 use ggo_worldlib::schemas::{ComponentSchema, defaults_for};
 use ggo_worldlib::sprites::tileset_doc::TILE_PX;
 use ggo_worldlib::world_file;
@@ -38,82 +39,9 @@ use ggo_worldlib::world_file;
 use crate::inspector;
 use crate::{NEW_BG_DIM, WorldPanel};
 
-/// The results column's width. Rems rather than pixels: `Picker` derives
-/// its own minimum width from a rems-based initial width and silently
-/// keeps its default from a pixel one.
-const PICKER_WIDTH: gpui::Rems = gpui::rems(18.);
-
-/// How tall the picker's list gets before it scrolls.
-const PICKER_MAX_HEIGHT: gpui::Rems = gpui::rems(20.);
-
-/// The card's overall width: the picker column plus a preview column
-/// wide enough for a sheet a few tiles across before it has to scroll.
-const CARD_WIDTH: gpui::Pixels = px(720.);
-
-/// How tall a preview gets, as a fraction of the window. Half, not the
-/// usual 70%: the modal layer parks the card 80px from the top, so a
-/// taller body pushes the footer off a short window.
-const PREVIEW_MAX_VH: f32 = 0.5;
-
 /// Preview tiles are drawn at this many pixels a side, so a 16px tile
 /// reads at a glance instead of at native size.
 const PREVIEW_CELL_PX: f32 = 32.;
-
-/// The scrolling region every card's preview sits in: both axes, because
-/// a sheet can outgrow the column either way, and a scroll container's
-/// automatic minimum size is zero, which is what stops the card growing
-/// to fit it.
-fn preview_region(id: &'static str, window: &mut Window) -> gpui::Stateful<gpui::Div> {
-    v_flex()
-        .id(id)
-        .flex_1()
-        .min_w_0()
-        .max_h(vh(PREVIEW_MAX_VH, window))
-        .overflow_scroll()
-}
-
-/// The "nothing to show yet" filler, centred with auto margins rather
-/// than `justify_center` -- a centred child in a scroller starts at a
-/// negative offset once it overflows and the scroll range can never walk
-/// back to it.
-fn preview_placeholder(message: &'static str) -> gpui::Div {
-    div().m_auto().child(
-        Label::new(message)
-            .size(LabelSize::Small)
-            .color(Color::Muted),
-    )
-}
-
-/// An empty-query pass through `fuzzy`: every candidate, in listing
-/// order, so a card that has never been typed into shows the same list
-/// the menu it replaced did.
-async fn matches_for(
-    candidates: Vec<StringMatchCandidate>,
-    query: String,
-    background: gpui::BackgroundExecutor,
-) -> Vec<StringMatch> {
-    if query.is_empty() {
-        return candidates
-            .into_iter()
-            .map(|candidate| StringMatch {
-                candidate_id: candidate.id,
-                string: candidate.string,
-                positions: Vec::new(),
-                score: 0.0,
-            })
-            .collect();
-    }
-    match_strings(
-        &candidates,
-        &query,
-        false,
-        true,
-        100,
-        &Default::default(),
-        background,
-    )
-    .await
-}
 
 // --------------------------------------------------------- add instance
 
@@ -185,8 +113,8 @@ impl AddInstanceModal {
             // on blur, which is the modal layer's job here.
             Picker::uniform_list(delegate, window, cx)
                 .embedded()
-                .initial_width(PICKER_WIDTH)
-                .max_height(PICKER_MAX_HEIGHT)
+                .initial_width(picker_card::PICKER_WIDTH)
+                .max_height(picker_card::PICKER_MAX_HEIGHT)
         });
         let mut this = AddInstanceModal {
             panel,
@@ -284,9 +212,9 @@ impl AddInstanceModal {
                         .color(Color::Muted),
                 )
         });
-        preview_region("ggo-world-add-instance-preview-region", window)
+        picker_card::preview_region("ggo-world-add-instance-preview-region", window)
             .when(body.is_none(), |this| {
-                this.child(preview_placeholder("No preview"))
+                this.child(picker_card::preview_placeholder("No preview"))
             })
             .children(body)
     }
@@ -332,16 +260,18 @@ impl Render for AddInstanceModal {
         };
         let on_confirm = cx.listener(|this: &mut Self, _, _, cx| this.confirm(cx));
         let focus_handle = self.focus_handle.clone();
-        card(
+        PickerCard::new(
             "ggo-world-add-instance-card",
             "Add instance",
             "The picked world is flattened into this one at load",
-            body,
-            has_candidates.then_some(("ggo-world-add-instance-confirm", "Add")),
-            on_confirm,
-            &focus_handle,
-            cx,
         )
+        .cancel_id("ggo-world-card-cancel")
+        .track_focus(&focus_handle)
+        .body(body)
+        .when(has_candidates, |card| {
+            card.confirm("ggo-world-add-instance-confirm", "Add")
+        })
+        .render(on_confirm, cx)
     }
 }
 
@@ -417,7 +347,7 @@ impl PickerDelegate for StemPickerDelegate {
             .map(|(id, stem)| StringMatchCandidate::new(id, stem))
             .collect();
         cx.spawn_in(window, async move |this, cx| {
-            let matches = matches_for(candidates, query, background).await;
+            let matches = picker_card::matches_for(candidates, query, background).await;
             this.update(cx, |this, cx| {
                 this.delegate.matches = matches;
                 this.delegate.selected_index = 0;
@@ -490,8 +420,8 @@ impl AddBackgroundModal {
         let picker = cx.new(|cx| {
             Picker::uniform_list(delegate, window, cx)
                 .embedded()
-                .initial_width(PICKER_WIDTH)
-                .max_height(PICKER_MAX_HEIGHT)
+                .initial_width(picker_card::PICKER_WIDTH)
+                .max_height(picker_card::PICKER_MAX_HEIGHT)
         });
         let dimension = cx.new(|cx| {
             let mut editor = editor::Editor::single_line(window, cx);
@@ -605,9 +535,9 @@ impl AddBackgroundModal {
                 .debug_selector(|| "ggo-world-add-bg-preview".into())
                 .child(img(image).nearest(true).w(width).h(height))
         });
-        preview_region("ggo-world-add-bg-preview-region", window)
+        picker_card::preview_region("ggo-world-add-bg-preview-region", window)
             .when(sized.is_none(), |this| {
-                this.child(preview_placeholder("No preview"))
+                this.child(picker_card::preview_placeholder("No preview"))
             })
             .children(sized)
     }
@@ -671,16 +601,18 @@ impl Render for AddBackgroundModal {
         };
         let on_confirm = cx.listener(|this: &mut Self, _, _, cx| this.confirm(cx));
         let focus_handle = self.focus_handle.clone();
-        card(
+        PickerCard::new(
             "ggo-world-add-bg-card",
-            &format!("Add background to bg{}", self.layer),
+            format!("Add background to bg{}", self.layer),
             "A new map is generated bound to the picked tileset",
-            body,
-            has_tilesets.then_some(("ggo-world-add-bg-confirm", "Add")),
-            on_confirm,
-            &focus_handle,
-            cx,
         )
+        .cancel_id("ggo-world-card-cancel")
+        .track_focus(&focus_handle)
+        .body(body)
+        .when(has_tilesets, |card| {
+            card.confirm("ggo-world-add-bg-confirm", "Add")
+        })
+        .render(on_confirm, cx)
     }
 }
 
@@ -755,7 +687,7 @@ impl PickerDelegate for BackgroundPickerDelegate {
             .map(|(id, rel)| StringMatchCandidate::new(id, rel))
             .collect();
         cx.spawn_in(window, async move |this, cx| {
-            let matches = matches_for(candidates, query, background).await;
+            let matches = picker_card::matches_for(candidates, query, background).await;
             this.update(cx, |this, cx| {
                 this.delegate.matches = matches;
                 this.delegate.selected_index = 0;
@@ -824,8 +756,8 @@ impl AddComponentModal {
         let picker = cx.new(|cx| {
             Picker::uniform_list(delegate, window, cx)
                 .embedded()
-                .initial_width(PICKER_WIDTH)
-                .max_height(PICKER_MAX_HEIGHT)
+                .initial_width(picker_card::PICKER_WIDTH)
+                .max_height(picker_card::PICKER_MAX_HEIGHT)
         });
         AddComponentModal {
             panel,
@@ -892,9 +824,9 @@ impl AddComponentModal {
                         .color(Color::Muted)
                 }))
         });
-        preview_region("ggo-world-add-component-preview-region", window)
+        picker_card::preview_region("ggo-world-add-component-preview-region", window)
             .when(seeded.is_none(), |this| {
-                this.child(preview_placeholder("No preview"))
+                this.child(picker_card::preview_placeholder("No preview"))
             })
             .children(seeded)
     }
@@ -933,16 +865,18 @@ impl Render for AddComponentModal {
         };
         let on_confirm = cx.listener(|this: &mut Self, _, _, cx| this.confirm(cx));
         let focus_handle = self.focus_handle.clone();
-        card(
+        PickerCard::new(
             "ggo-world-add-component-card",
-            &format!("Add component to entity #{}", self.entity_ix),
+            format!("Add component to entity #{}", self.entity_ix),
             "The picked schema's fields are seeded at their defaults",
-            body,
-            has_schemas.then_some(("ggo-world-add-component-confirm", "Add")),
-            on_confirm,
-            &focus_handle,
-            cx,
         )
+        .cancel_id("ggo-world-card-cancel")
+        .track_focus(&focus_handle)
+        .body(body)
+        .when(has_schemas, |card| {
+            card.confirm("ggo-world-add-component-confirm", "Add")
+        })
+        .render(on_confirm, cx)
     }
 }
 
@@ -1017,7 +951,7 @@ impl PickerDelegate for SchemaPickerDelegate {
             .map(|(id, schema)| StringMatchCandidate::new(id, &schema.name))
             .collect();
         cx.spawn_in(window, async move |this, cx| {
-            let matches = matches_for(candidates, query, background).await;
+            let matches = picker_card::matches_for(candidates, query, background).await;
             this.update(cx, |this, cx| {
                 this.delegate.matches = matches;
                 this.delegate.selected_index = 0;
@@ -1119,8 +1053,8 @@ impl AssetStemModal {
         let picker = cx.new(|cx| {
             Picker::uniform_list(delegate, window, cx)
                 .embedded()
-                .initial_width(PICKER_WIDTH)
-                .max_height(PICKER_MAX_HEIGHT)
+                .initial_width(picker_card::PICKER_WIDTH)
+                .max_height(picker_card::PICKER_MAX_HEIGHT)
         });
         AssetStemModal {
             panel,
@@ -1164,16 +1098,15 @@ impl ModalView for AssetStemModal {}
 impl Render for AssetStemModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focus_handle = self.focus_handle(cx);
-        card(
+        PickerCard::new(
             "ggo-world-asset-stem-card",
-            &format!("Pick a {}", asset_noun(&self.ext)),
-            &format!("Fuzzy-search the project's .{} files", self.ext),
-            self.picker.clone().into_any_element(),
-            None,
-            |_, _, _| {},
-            &focus_handle,
-            cx,
+            format!("Pick a {}", asset_noun(&self.ext)),
+            format!("Fuzzy-search the project's .{} files", self.ext),
         )
+        .cancel_id("ggo-world-card-cancel")
+        .track_focus(&focus_handle)
+        .body(self.picker.clone())
+        .render(|_, _, _| {}, cx)
     }
 }
 
@@ -1247,7 +1180,7 @@ impl PickerDelegate for AssetStemDelegate {
             .collect();
         let initial_stem = self.initial_stem.take();
         cx.spawn_in(window, async move |this, cx| {
-            let matches = matches_for(candidates, query, background).await;
+            let matches = picker_card::matches_for(candidates, query, background).await;
             this.update(cx, |this, cx| {
                 this.delegate.matches = matches;
                 this.delegate.selected_index = initial_stem
@@ -1294,58 +1227,3 @@ impl PickerDelegate for AssetStemDelegate {
     }
 }
 
-// ------------------------------------------------------------- chrome
-
-/// The shared card shell all three creation cards draw: header, one
-/// section holding the body, and a footer of Confirm + Cancel. `confirm`
-/// is `None` when the card has nothing to offer, which is what leaves a
-/// dead button off the footer rather than greying one on.
-#[allow(clippy::too_many_arguments)]
-fn card<V>(
-    id: &'static str,
-    headline: &str,
-    description: &str,
-    body: gpui::AnyElement,
-    confirm: Option<(&'static str, &'static str)>,
-    on_confirm: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-    focus_handle: &FocusHandle,
-    cx: &mut Context<V>,
-) -> gpui::Div
-where
-    V: EventEmitter<DismissEvent> + 'static,
-{
-    let cancel_id = "ggo-world-card-cancel";
-    div()
-        // The card's own handle, so Escape still lands when the picker
-        // is not rendered (nothing to search) and never took focus.
-        .track_focus(focus_handle)
-        .elevation_3(cx)
-        .w(CARD_WIDTH)
-        .child(
-            Modal::new(id, None)
-                .header(
-                    ModalHeader::new()
-                        .headline(headline.to_string())
-                        .description(description.to_string()),
-                )
-                .section(Section::new().child(body))
-                .footer(
-                    ModalFooter::new().end_slot(
-                        h_flex()
-                            .gap_1()
-                            .children(confirm.map(|(button_id, label)| {
-                                div()
-                                    .debug_selector(move || button_id.into())
-                                    .child(Button::new(button_id, label).on_click(on_confirm))
-                            }))
-                            .child(
-                                div()
-                                    .debug_selector(move || cancel_id.into())
-                                    .child(Button::new(cancel_id, "Cancel").on_click(
-                                        cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
-                                    )),
-                            ),
-                    ),
-                ),
-        )
-}
