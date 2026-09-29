@@ -2872,8 +2872,7 @@ impl OpenWorld {
         }
         // A `.map` whose cells came from the cart is left alone here: the
         // cart handed them over, so re-arming its slot would push a copy
-        // of what it is already drawing, and `note_doc_changed` would
-        // reload the world under a running session for it.
+        // of what it is already drawing.
         written.retain(|rel| !from_cart.contains(rel));
         // The map on disk is what a slot with no session open is pushed
         // from, and the write is the moment it stops being the pre-stroke
