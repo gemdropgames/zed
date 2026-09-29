@@ -119,45 +119,6 @@ pub fn asset_status(asset_root: &Path, stem: &str, ext: &str) -> AssetStatus {
     }
 }
 
-/// Rank `candidates` against the typed text: case-insensitive, prefix
-/// matches first, then substring, then in-order subsequence; ties keep
-/// the input's (sorted) order, non-matches drop out. Empty input offers
-/// everything -- that is how a fresh project's `sprites/gg_icon` surfaces
-/// before anything is typed.
-///
-/// Deliberately not zed's `fuzzy` crate: these lists are a few hundred
-/// stems at most and this three-tier rank is testable without an
-/// executor.
-pub fn rank_stem_matches(typed: &str, candidates: &[String]) -> Vec<String> {
-    let needle = typed.trim().to_lowercase();
-    if needle.is_empty() {
-        return candidates.to_vec();
-    }
-    let mut ranked: Vec<(u8, &String)> = candidates
-        .iter()
-        .filter_map(|candidate| {
-            let hay = candidate.to_lowercase();
-            let rank = if hay.starts_with(&needle) {
-                0
-            } else if hay.contains(&needle) {
-                1
-            } else if is_subsequence(&needle, &hay) {
-                2
-            } else {
-                return None;
-            };
-            Some((rank, candidate))
-        })
-        .collect();
-    ranked.sort_by_key(|(rank, _)| *rank);
-    ranked.into_iter().map(|(_, stem)| stem.clone()).collect()
-}
-
-fn is_subsequence(needle: &str, hay: &str) -> bool {
-    let mut hay_chars = hay.chars();
-    needle.chars().all(|wanted| hay_chars.any(|c| c == wanted))
-}
-
 /// The selected entity's `Transform.pos`, if it has a well-formed one --
 /// ggo-ide's `entity_pos` (drag-start anchor).
 pub fn entity_pos(state: &WorldState, index: usize) -> Option<[f64; 2]> {
@@ -659,35 +620,6 @@ mod tests {
             None,
             "only entity fields complete"
         );
-    }
-
-    #[test]
-    fn rank_stem_matches_prefers_prefix_then_substring_then_subsequence() {
-        let candidates: Vec<String> = ["icons/gg", "sprites/gg_icon", "sprites/icon", "tiles/logo"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert_eq!(
-            rank_stem_matches("icon", &candidates),
-            vec!["icons/gg", "sprites/gg_icon", "sprites/icon"],
-            "prefix first, substrings keep sorted order, no-match drops"
-        );
-        assert_eq!(
-            rank_stem_matches("spgg", &candidates),
-            vec!["sprites/gg_icon"],
-            "subsequence still matches"
-        );
-        assert_eq!(
-            rank_stem_matches("GG_ICON", &candidates),
-            vec!["sprites/gg_icon"],
-            "case-insensitive"
-        );
-        assert_eq!(
-            rank_stem_matches("", &candidates),
-            candidates,
-            "empty input offers everything"
-        );
-        assert!(rank_stem_matches("zzz", &candidates).is_empty());
     }
 
     #[test]

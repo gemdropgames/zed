@@ -1065,20 +1065,44 @@ impl PickerDelegate for SchemaPickerDelegate {
 
 // ------------------------------------------------------------- asset stem
 
-/// The fuzzy stem picker raised by a `.spr` Asset field's magnifier
-/// button (`WorldPanel::open_asset_stem_modal`). No preview pane -- the
-/// inline suggestion list it replaces never had one either -- so the
-/// card is just the picker itself.
+/// What a confirmed [`AssetStemModal`] pick commits into.
+#[derive(Clone)]
+pub enum AssetPick {
+    /// An Asset field (`WorldPanel::open_asset_stem_modal`): the pick is
+    /// the field's new stem.
+    Field(inspector::FieldTarget),
+    /// The color picker's palette: the pick is a `.pal` rel.
+    Palette,
+}
+
+/// The one fuzzy picker every asset selection in the world panel goes
+/// through -- each Asset field's button (any extension) and the color
+/// picker's palette. No preview pane, so the card is just the picker.
 pub struct AssetStemModal {
     panel: WeakEntity<WorldPanel>,
-    target: inspector::FieldTarget,
+    pick: AssetPick,
+    /// The asset kind's extension, for the card's wording.
+    ext: String,
     picker: Entity<Picker<AssetStemDelegate>>,
+}
+
+/// A human noun for an asset extension, for the picker's wording.
+pub fn asset_noun(ext: &str) -> String {
+    match ext {
+        "spr" => "sprite".to_string(),
+        "til" => "tileset".to_string(),
+        "map" => "map".to_string(),
+        "pal" => "palette".to_string(),
+        "adp" | "wav" | "ogg" => "sound".to_string(),
+        other => format!(".{other} asset"),
+    }
 }
 
 impl AssetStemModal {
     pub fn new(
         panel: WeakEntity<WorldPanel>,
-        target: inspector::FieldTarget,
+        pick: AssetPick,
+        ext: String,
         candidates: Vec<String>,
         current_stem: Option<String>,
         window: &mut Window,
@@ -1086,6 +1110,7 @@ impl AssetStemModal {
     ) -> Self {
         let delegate = AssetStemDelegate {
             modal: cx.weak_entity(),
+            placeholder: format!("Pick a {}…", asset_noun(&ext)).into(),
             candidates,
             matches: Vec::new(),
             selected_index: 0,
@@ -1099,7 +1124,8 @@ impl AssetStemModal {
         });
         AssetStemModal {
             panel,
-            target,
+            pick,
+            ext,
             picker,
         }
     }
@@ -1109,14 +1135,17 @@ impl AssetStemModal {
         &self.picker
     }
 
-    /// A confirmed pick: through `WorldPanel::commit_picked_stem`, the
-    /// same op-apply path `pick_stem`'s editor round-trip commits
-    /// through -- there is no rendered editor behind a `.spr` field's row
-    /// for this to update.
+    /// A confirmed pick: a field commits through
+    /// `WorldPanel::commit_picked_stem` (the inspector's op-apply path --
+    /// there is no editor behind an Asset field's row to round-trip it
+    /// through); a palette loads through `picker_select_pal`.
     fn confirm(&mut self, stem: String, cx: &mut Context<Self>) {
-        let target = self.target.clone();
+        let pick = self.pick.clone();
         self.panel
-            .update(cx, |panel, cx| panel.commit_picked_stem(target, stem, cx))
+            .update(cx, |panel, cx| match pick {
+                AssetPick::Field(target) => panel.commit_picked_stem(target, stem, cx),
+                AssetPick::Palette => panel.picker_select_pal(stem, cx),
+            })
             .ok();
         cx.emit(DismissEvent);
     }
@@ -1137,8 +1166,8 @@ impl Render for AssetStemModal {
         let focus_handle = self.focus_handle(cx);
         card(
             "ggo-world-asset-stem-card",
-            "Pick a sprite",
-            "Fuzzy-search the project's .spr stems",
+            &format!("Pick a {}", asset_noun(&self.ext)),
+            &format!("Fuzzy-search the project's .{} files", self.ext),
             self.picker.clone().into_any_element(),
             None,
             |_, _, _| {},
@@ -1150,6 +1179,7 @@ impl Render for AssetStemModal {
 
 pub struct AssetStemDelegate {
     modal: WeakEntity<AssetStemModal>,
+    placeholder: Arc<str>,
     candidates: Vec<String>,
     matches: Vec<StringMatch>,
     selected_index: usize,
@@ -1182,7 +1212,7 @@ impl PickerDelegate for AssetStemDelegate {
     }
 
     fn placeholder_text(&self, _: &mut Window, _: &mut App) -> Arc<str> {
-        "Pick a sprite…".into()
+        self.placeholder.clone()
     }
 
     fn match_count(&self) -> usize {
