@@ -41,6 +41,19 @@ pub fn cell_at(
     Some(row * w_tiles + col)
 }
 
+/// The frame cell under a DISPLAYED cell of a flipped preview: an H flip
+/// mirrors the column, a V flip the row (`flip` is `(h, v)`).
+pub fn flip_cell(cell: usize, w_tiles: usize, h_tiles: usize, flip: (bool, bool)) -> usize {
+    let (mut col, mut row) = (cell % w_tiles, cell / w_tiles);
+    if flip.0 {
+        col = w_tiles - 1 - col;
+    }
+    if flip.1 {
+        row = h_tiles - 1 - row;
+    }
+    row * w_tiles + col
+}
+
 /// Where the tile picker sheet's zero-fill padding starts, as `(col,
 /// row)` of the first pad cell -- `None` when the last row is full (or
 /// the grid is degenerate). The sheet is composed `cols` wide with a
@@ -191,6 +204,16 @@ mod tests {
     use ggo_worldlib::sprites::sprite_doc::blank_sprite_state;
 
     // ------------------------------------------------------------ cell_at
+
+    #[test]
+    fn flip_cell_mirrors_column_and_row_under_flip() {
+        // 3x2 grid: cell 0 is (col 0, row 0), cell 5 is (col 2, row 1).
+        assert_eq!(flip_cell(0, 3, 2, (false, false)), 0);
+        assert_eq!(flip_cell(0, 3, 2, (true, false)), 2);
+        assert_eq!(flip_cell(0, 3, 2, (false, true)), 3);
+        assert_eq!(flip_cell(0, 3, 2, (true, true)), 5);
+        assert_eq!(flip_cell(4, 3, 2, (true, false)), 4, "the centre column stays put");
+    }
 
     #[test]
     fn cell_at_maps_quadrants_of_a_2x2_grid() {
