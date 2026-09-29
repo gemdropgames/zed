@@ -132,8 +132,7 @@ pub fn dragged_pos(
 }
 
 /// The map cell a world-space point lands in, for a map whose top-left
-/// pixel sits at `anchor` (world origin for a background slot,
-/// `Transform.pos + (col, row) * TILE_PX` for a `Tilemap` entity).
+/// pixel sits at `anchor` (world origin for a background slot).
 ///
 /// Floors per axis, so a point ABOVE or LEFT of the anchor yields a
 /// negative cell rather than clamping onto row/column 0 -- an off-map

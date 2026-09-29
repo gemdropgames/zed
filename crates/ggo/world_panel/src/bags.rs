@@ -288,15 +288,6 @@ mod tests {
                 ],
             ),
             entry(
-                "Tilemap",
-                vec![
-                    field("layer", FieldKind::Str),
-                    field("stem", asset("png")),
-                    field("col", FieldKind::Int),
-                    field("row", FieldKind::Int),
-                ],
-            ),
-            entry(
                 "Music",
                 vec![
                     field("stem", asset("ogg")),
@@ -361,15 +352,22 @@ mod tests {
             }),
         );
         round_trip(
-            "Tilemap",
-            json!({"layer": "bg0", "stem": "town", "col": 3, "row": -1}),
-        );
-        round_trip(
             "Music",
             json!({"stem": "theme", "once": false, "volume": 64}),
         );
         round_trip("Sfx", json!({"stem": "blip", "looping": true}));
         round_trip("Camera", json!({"is_active": true, "is_centered": false}));
+    }
+
+    #[test]
+    fn tilemap_is_not_a_builtin_component() {
+        let local: Vec<String> = builtins().into_iter().map(|e| e.name).collect();
+        assert!(!local.iter().any(|n| n == "Tilemap"));
+        let real: Vec<String> = ggo_worldlib::schemas::builtin_schemas()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(!real.iter().any(|n| n == "Tilemap"));
     }
 
     #[test]

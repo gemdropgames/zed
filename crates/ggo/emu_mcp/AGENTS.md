@@ -83,7 +83,7 @@ than reloaded (unsaved edits, undo history and camera survive), and
 opening one world never disturbs another. `world_screenshot`
 draws that same authored layout: by default the 320x240 device screen
 framed on the world's active camera (the engine's own centring rule), or
-the whole scene's bounding box with `full`. Sprites, tilemaps and
+the whole scene's bounding box with `full`. Sprites, backgrounds and
 backgrounds composite as real pixels; text and placeholder entities are
 flat boxes, and the editor's selection outline is left out.
 

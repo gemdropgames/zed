@@ -60,7 +60,7 @@ pub fn field_kind<'a>(
 /// The Asset extension `target` completes against, or `None` for every
 /// non-asset field. Keyed off the SCHEMA kind, so a user component's
 /// `asset:<ext>` field completes exactly like the builtins' (`Sprite`/
-/// `MetaSprite` -> `spr`, `Tilemap` -> `map`, `Text.font` -> `til`, …).
+/// `MetaSprite` -> `spr`, `Text.font` -> `til`, …).
 pub fn asset_field_ext(target: &FieldTarget, schemas: &[ComponentSchema]) -> Option<String> {
     let FieldTarget::EntityField {
         component, field, ..
@@ -646,7 +646,6 @@ mod tests {
         let ext = |c: &str, f: &str| asset_field_ext(&entity_field(c, f), &schemas);
         assert_eq!(ext("Sprite", "stem").as_deref(), Some("spr"));
         assert_eq!(ext("MetaSprite", "stem").as_deref(), Some("spr"));
-        assert_eq!(ext("Tilemap", "stem").as_deref(), Some("map"));
         assert_eq!(ext("Text", "font").as_deref(), Some("til"));
         assert_eq!(ext("Portrait", "face").as_deref(), Some("png"));
         assert_eq!(ext("Transform", "pos"), None, "Vec2 never completes");

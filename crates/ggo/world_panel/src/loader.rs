@@ -106,17 +106,13 @@ pub fn load_world(project_dir: &Path, rel: &str) -> Result<LoadedWorld, String> 
     // `collect_load_targets` for entities/subtrees, plus the merged
     // background stems (the merged set is the only source of background map
     // loads; `collect_load_targets` never reports background stems).
-    let (sprite_stems, map_stems, meta_targets) = collect_load_targets(&state);
+    let (sprite_stems, meta_targets) = collect_load_targets(&state);
     let mut sprite_loads = AssetLoads::new();
     for stem in sprite_stems {
         let load = settle(compose_sprite_rgba(project_dir, &stem));
         sprite_loads.insert(stem, load);
     }
     let mut map_loads = AssetLoads::new();
-    for stem in map_stems {
-        let load = settle(io::compose_map_rgba(project_dir, &stem).map_err(|e| e.to_string()));
-        map_loads.insert(stem, load);
-    }
     fill_missing_background_loads(project_dir, &merged, &mut map_loads);
     let mut meta_sprite_loads = AssetLoads::new();
     for (stem, clip) in meta_targets {
@@ -278,19 +274,13 @@ pub fn fill_missing_asset_loads(
     project_dir: &Path,
     state: &WorldState,
     sprite_loads: &mut AssetLoads,
-    map_loads: &mut AssetLoads,
     meta_sprite_loads: &mut AssetLoads,
 ) {
-    let (sprite_stems, map_stems, meta_targets) = collect_load_targets(state);
+    let (sprite_stems, meta_targets) = collect_load_targets(state);
     for stem in sprite_stems {
         sprite_loads
             .entry(stem.clone())
             .or_insert_with(|| settle(compose_sprite_rgba(project_dir, &stem)));
-    }
-    for stem in map_stems {
-        map_loads.entry(stem.clone()).or_insert_with(|| {
-            settle(io::compose_map_rgba(project_dir, &stem).map_err(|e| e.to_string()))
-        });
     }
     for (stem, clip) in meta_targets {
         let key = render::meta_sprite_load_key(&stem, &clip);
