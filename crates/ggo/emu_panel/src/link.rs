@@ -13,25 +13,23 @@
 //! buffer, which only ever hands out whole frames.
 
 use ggo_common::LinkEndpoint;
-use ggo_emu_core::peripherals::Peripherals;
+use ggo_emu_wasm::WasmEmu;
 
-/// One frame boundary's worth of link traffic, both directions.
+/// One frame boundary's worth of link traffic, both directions. A failure
+/// is the emulator module's, and ends the run.
 pub fn pump_link(
-    p: &mut Peripherals,
+    emu: &mut WasmEmu,
     endpoint: &LinkEndpoint,
     reader: &mut ggo_comm::MessageReader,
-) {
-    pump_outbound(p, endpoint);
-    let tx = p.take_comm();
-    pump_inbound(&tx, endpoint, reader);
-}
-
-/// Host -> cart: everything the host queued since the last boundary,
-/// injected as if it had arrived on the board's UART.
-fn pump_outbound(p: &mut Peripherals, endpoint: &LinkEndpoint) {
+) -> anyhow::Result<()> {
+    // Host -> cart: everything the host queued since the last boundary,
+    // injected as if it had arrived on the board's UART.
     for bytes in endpoint.take_outbound() {
-        p.uart_inject(&bytes);
+        emu.uart_inject(&bytes)?;
     }
+    let tx = emu.take_comm()?;
+    pump_inbound(&tx, endpoint, reader);
+    Ok(())
 }
 
 /// Cart -> host: decode `tx` (the cart's comm TX bytes since the last
@@ -53,11 +51,9 @@ fn pump_inbound(tx: &[u8], endpoint: &LinkEndpoint, reader: &mut ggo_comm::Messa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::drive::{fixture, tests_support::test_emulator};
     use ggo_common::LinkEndpoint;
-    use ggo_emu_core::cpu::Cpu;
-    use ggo_emu_core::mmu::Mmu;
-    use ggo_emu_core::peripherals::Peripherals;
-    use ggo_emu_core::sandbox::ARENA_BASE;
+    use ggo_emu_wasm::TurnEvent;
 
     fn wire(channel: u8, payload: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -69,44 +65,38 @@ mod tests {
         wire(ggo_wire::channel::APP, payload)
     }
 
-    /// What a cart's `comm_send(payload)` does, driven the way
-    /// `ggo-emu-core`'s own runtime tests drive a syscall: the framed
-    /// bytes land in the peripherals' comm TX buffer, which is exactly
-    /// what a real run's frame boundary finds there.
-    fn cart_comm_send(cpu: &mut Cpu, mmu: &mut Mmu, p: &mut Peripherals, payload: &[u8]) {
-        for (i, b) in payload.iter().enumerate() {
-            mmu.write_u8(ARENA_BASE + i as u32, *b).unwrap();
+    /// Both halves of [`pump_link`] against a real cart: the host's
+    /// datagram reaches the echo cart's `comm_recv` and comes back out of
+    /// the endpoint decoded, with nothing leaking into the text log.
+    #[test]
+    fn pump_link_carries_a_datagram_to_the_cart_and_back() {
+        let mut emu = test_emulator()
+            .start_cart(&fixture::comm_echo_cart(), 0, None)
+            .expect("the echo cart loads");
+        let endpoint = LinkEndpoint::new();
+        let mut reader = ggo_comm::MessageReader::default();
+        endpoint
+            .send_app(b"hello")
+            .expect("a five-byte payload fits");
+
+        let mut inbound = Vec::new();
+        for _ in 0..30 {
+            loop {
+                match emu.run_turn(0, 0) {
+                    TurnEvent::Vsync(_) => break,
+                    TurnEvent::Budget => {}
+                    other => panic!("the echo cart stopped: {other:?}"),
+                }
+            }
+            pump_link(&mut emu, &endpoint, &mut reader).expect("the pump succeeds");
+            inbound.extend(endpoint.try_recv_inbound());
+            if !inbound.is_empty() {
+                break;
+            }
         }
-        cpu.write_reg(17, gemdrop_sdk::sys::COMM_SEND as u32);
-        cpu.write_reg(10, ARENA_BASE);
-        cpu.write_reg(11, payload.len() as u32);
-        cpu.write_reg(12, 0);
-        ggo_emu_core::runtime::dispatch_ecall(cpu, mmu, p, cpu.pc, false);
-        assert_eq!(cpu.regs[10], 0, "comm_send was refused");
-    }
-
-    #[test]
-    fn outbound_wire_bytes_reach_the_carts_comm_queue() {
-        let mut p = Peripherals::new(0, 0);
-        let endpoint = LinkEndpoint::new();
-        let mut reader = ggo_comm::MessageReader::default();
-        endpoint.send_wire(app_wire(b"hello"));
-        pump_link(&mut p, &endpoint, &mut reader);
-        assert_eq!(p.comm.pop_app().unwrap().payload(), b"hello");
-    }
-
-    #[test]
-    fn cart_app_frames_are_decoded_into_inbound_payloads() {
-        let mut p = Peripherals::new(0, 0);
-        let mut cpu = Cpu::new(ARENA_BASE);
-        let mut mmu = Mmu::new();
-        let endpoint = LinkEndpoint::new();
-        let mut reader = ggo_comm::MessageReader::default();
-        cart_comm_send(&mut cpu, &mut mmu, &mut p, b"pong");
-        pump_link(&mut p, &endpoint, &mut reader);
-        assert_eq!(endpoint.try_recv_inbound(), vec![b"pong".to_vec()]);
+        assert_eq!(inbound, vec![b"hello".to_vec()]);
         assert!(
-            p.take_log().is_empty(),
+            emu.take_log().expect("the log drains").is_empty(),
             "comm frames never reach the console's text log"
         );
     }

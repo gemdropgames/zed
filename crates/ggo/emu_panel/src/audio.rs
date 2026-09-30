@@ -46,7 +46,7 @@
 //!
 //! ## The tap: emu thread -> `RingWriter` -> `RingReader` -> cpal callback
 //!
-//! `ggo_emu_core::apu::Apu` lives inside `Peripherals`, entirely on the
+//! The emulated APU lives inside the wasm emulator module, entirely on the
 //! emulator thread. The cpal realtime callback runs on a separate thread
 //! cpal owns, so samples are *copied* across rather than shared.
 //! [`channel`] returns a [`RingWriter`]/[`RingReader`] pair sharing a small
@@ -142,8 +142,8 @@ use cpal::{FromSample, SizedSample};
 /// drifting an ever-larger backlog.
 ///
 /// 16384 `i16` = 8192 stereo pairs ≈ **256 ms** at the APU's mix rate
-/// (`ggo_emu_core::apu::MIX_RATE`, 32020 Hz).
-const MAX_QUEUED: usize = ggo_emu_core::apu::RING_LEN * 2;
+/// (`ggo_emu_abi::MIX_RATE`, 32020 Hz).
+const MAX_QUEUED: usize = ggo_emu_abi::RING_LEN * 2;
 
 /// One interleaved stereo sample pair -- the unit [`fill`] resamples in.
 const STEREO_PAIR: usize = 2;
@@ -692,7 +692,7 @@ mod tests {
     /// production actually produces.
     const CALLBACK_FRAMES: usize = 480;
     const DEVICE_RATE: u32 = 48_000;
-    const MIX_RATE: u32 = ggo_emu_core::apu::MIX_RATE;
+    const MIX_RATE: u32 = ggo_emu_abi::MIX_RATE;
 
     /// A ring that has already been fed, i.e. primed and live -- the
     /// steady state most of these tests care about.

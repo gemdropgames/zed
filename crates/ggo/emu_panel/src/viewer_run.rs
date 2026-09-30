@@ -210,7 +210,9 @@ pub(crate) fn boot(
 ) -> bool {
     let project = workspace.project().clone();
     let Some(root) = project_root(&project, cx) else {
-        endpoint.set_state(ViewerState::Stopped("no project folder is open".to_string()));
+        endpoint.set_state(ViewerState::Stopped(
+            "no project folder is open".to_string(),
+        ));
         // No run to register: there is nothing for one to build.
         return true;
     };
@@ -444,8 +446,20 @@ impl ViewerRun {
 
     fn boot(&mut self, root: PathBuf, ggo: PathBuf, cx: &mut Context<Self>) {
         let cart = menu::cart_selection(&root, &ggo);
-        let (session, frames) =
-            drive::start(root.join(&cart), cart, None, Some(self.endpoint.clone()));
+        let emulator = match drive::current_emulator(cx) {
+            Ok(emulator) => emulator,
+            Err(error) => {
+                self.stop_with(error.to_string(), cx);
+                return;
+            }
+        };
+        let (session, frames) = drive::start(
+            emulator,
+            root.join(&cart),
+            cart,
+            None,
+            Some(self.endpoint.clone()),
+        );
         self.session = Some(session);
         self.endpoint.set_state(ViewerState::Running);
         self._pump_task = Some(cx.spawn(async move |this, cx| {
@@ -1119,7 +1133,11 @@ mod tests {
         assert_eq!(builds(&calls), 1, "one editor-cart build");
         assert_ne!(endpoint.state(), ggo_common::ViewerState::Building);
         cx.update(|_, cx| {
-            assert_eq!(cx.global::<ViewerRuns>().runs.len(), 1, "one run registered");
+            assert_eq!(
+                cx.global::<ViewerRuns>().runs.len(),
+                1,
+                "one run registered"
+            );
         });
         panel.read_with(cx, |panel, _| {
             assert!(panel.session.is_none(), "the pane runs nothing");
@@ -1530,7 +1548,11 @@ mod tests {
             })
             .expect("the booter claimed the boot");
         cx.update(|_, cx| {
-            assert_eq!(cx.global::<ViewerRuns>().runs.len(), 1, "one run registered");
+            assert_eq!(
+                cx.global::<ViewerRuns>().runs.len(),
+                1,
+                "one run registered"
+            );
         });
 
         endpoint.request_stop();
@@ -1568,7 +1590,9 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(builds(&calls), 1);
 
-        let fs = workspace.read_with(cx, |workspace, cx| workspace.project().read(cx).fs().clone());
+        let fs = workspace.read_with(cx, |workspace, cx| {
+            workspace.project().read(cx).fs().clone()
+        });
         fs.as_fake()
             .insert_file("/proj/main.rs", b"fn main() {}".to_vec())
             .await;

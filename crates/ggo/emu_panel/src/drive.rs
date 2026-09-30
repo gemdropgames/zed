@@ -1,31 +1,24 @@
 //! The core drive loop, ported from `ggo-emu/src/lib.rs::run_cart` +
-//! `ggo-emu/src/native.rs`. Nothing here emulates anything -- every step
-//! is a `ggo_emu_core` call, in the same order and with the same
-//! arguments the standalone binary uses.
+//! `ggo-emu/src/native.rs`. Nothing here emulates anything -- the cart runs
+//! inside the wasm emulator module (`ggo_emu_wasm::WasmEmu`), and every
+//! step is a call into it, in the same order the standalone binary uses.
 //!
 //! ## Why an OS thread and not `cx.background_spawn`
 //!
-//! `ggo_emu_core::perfsim::PerfSim` holds
-//! `Option<Box<dyn CacheProfiler>>` (no `+ Send` bound), so `Peripherals`
-//! -- and therefore the whole `(Cpu, Mmu, Peripherals)` triple -- is
-//! `!Send`. `background_spawn` needs a `Send` future, which would hold
-//! that state across the per-frame await. A plain `std::thread::spawn`
-//! only requires the *closure captures* to be `Send`, and the captures
-//! here are a `PathBuf`, a channel sender and a handful of `Arc`s; the
-//! emulator state is constructed inside the thread and never crosses a
-//! boundary. Fixing this upstream would mean a `+ Send` bound in the
-//! `ggo` repo, which is out of scope for a fork-side task.
+//! A `WasmEmu` owns a wasmtime store, and a turn can run for up to
+//! 5 million instructions (the module's per-turn budget), so the drive loop is blocking work
+//! with a per-frame pacing sleep. A plain `std::thread::spawn` keeps it off
+//! the executors entirely; the emulator instance is constructed inside the
+//! thread and never crosses a boundary.
 //!
 //! ## How a run ends, and where its perf data comes from
 //!
-//! The perf sim IS enabled (`Peripherals::perf.enable()`, exactly as
-//! `ggo-ide`'s `CartStepper::new` does), so every frame the cart presents
-//! appends a `FrameRecord` to `p.perf.frames`. On the way out -- cart
-//! exit, CPU fault, or the panel's stop flag -- the thread serialises the
-//! whole run with `ggo_emu_core::perfsim::perf_json` (the same call
-//! `CartStepper::perf_json` makes, same arguments) into a
-//! [`PerfSnapshot`], stores it in the shared [`Session`] slot, and
-//! returns. [`Session::wait`] joins the thread and hands the panel the
+//! The module's perf sim is always on (as `ggo-ide`'s `CartStepper::new`
+//! enables it), so every frame the cart presents is recorded. On the way
+//! out -- cart exit, CPU fault, or the panel's stop flag -- the thread
+//! asks the module for the whole run's perf JSON (`perf_json`, the same
+//! document `CartStepper::perf_json` produces) and stores it in a
+//! [`PerfSnapshot`] in the shared [`Session`] slot, then returns. [`Session::wait`] joins the thread and hands the panel the
 //! snapshot plus the run's diagnostic lines, which is what
 //! [`crate::ingest`] writes to the database.
 //!
@@ -60,9 +53,10 @@
 //!   budget. `ggo-ide` makes the same call for the same reason (a UI
 //!   pane wants real-time video; the budget overrun is data to plot, not
 //!   something to act on).
-//! - **Save-file persistence.** The save region exists and
-//!   `save_read`/`save_write` work, but `savefile::flush_save` is not
-//!   called, so a pane run's saves are in-memory only.
+//! - **Save-file persistence beyond the standalone's rule.** A run loads its
+//!   save file at start, flushes on a dirty frame at most once a second and
+//!   once more on the way out, exactly as `run_cart` does -- see
+//!   [`save_file_for`].
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -71,15 +65,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ggo_common::{LinkEndpoint, ViewerState};
-use ggo_emu_core::apu::Apu;
-use ggo_emu_core::cart::Cart;
-use ggo_emu_core::cpu::{Cpu, Trap};
-use ggo_emu_core::mmu::Mmu;
-use ggo_emu_core::peripherals::{Peripherals, SCREEN_HEIGHT, SCREEN_WIDTH};
-use ggo_emu_core::ppu::PpuSnapshot;
-use ggo_emu_core::run::{FrameEvent, run_until_event};
-use ggo_emu_core::sandbox;
-use ggo_emu_core::savefile;
+use ggo_emu_abi::{MIX_RATE, PpuSnapshot, SCREEN_HEIGHT, SCREEN_WIDTH};
+use ggo_emu_wasm::{LoadedEmulator, TurnEvent, WasmEmu};
 
 use crate::audio::{AudioStatus, RingWriter};
 use crate::uart::UartLog;
@@ -101,14 +88,8 @@ pub const FRAME_TIME: Duration = Duration::from_micros(16_667);
 /// the point -- reaching a late-game fault sooner -- is long since made.
 pub const MAX_SPEED: u32 = 10;
 
-/// Instructions interpreted per driver turn before the loop comes up for
-/// air. `ggo_emu::PER_TURN_BUDGET` verbatim: big enough to clear a
-/// frame's work, small enough that a cart spinning without `vsync_wait`
-/// still lets Stop take effect promptly.
-pub const PER_TURN_BUDGET: u64 = 5_000_000;
-
 /// Framebuffer geometry, re-exported so the panel doesn't have to depend
-/// on `ggo_emu_core::peripherals` directly.
+/// on `ggo_emu_abi` directly.
 pub const WIDTH: u32 = SCREEN_WIDTH as u32;
 pub const HEIGHT: u32 = SCREEN_HEIGHT as u32;
 
@@ -139,7 +120,7 @@ pub struct PerfSnapshot {
     /// `cart.header.title` with no prefix), so a cart profiled from
     /// either tool lands on the same `cart` row.
     pub cart: String,
-    /// `ggo_emu_core::perfsim::perf_json`'s output for the whole run.
+    /// The emulator module's perf JSON for the whole run.
     pub perf_json: String,
     /// Frames the perf sim actually recorded. Zero means the cart never
     /// reached a single `vsync_wait`, which is `ggo-ide`'s "no frames
@@ -230,7 +211,7 @@ pub struct Session {
 
 impl Session {
     /// Signal the thread to stop. Deliberately does NOT join: a turn can
-    /// take up to [`PER_TURN_BUDGET`] instructions, and blocking the UI
+    /// take up to 5 million instructions (the module's per-turn budget), and blocking the UI
     /// thread on it would stall the whole window. The thread checks the
     /// flag at the top of its next turn, stores its outcome, and returns.
     /// [`Self::wait`] -- which the panel only ever calls from a
@@ -374,6 +355,18 @@ impl Drop for Session {
     }
 }
 
+/// The emulator a run should start on. Tests and `ggo_smoke` never install
+/// an `EmuRuntime` (loading one compiles the module off-thread, per test),
+/// so when no runtime exists at all they get the shared bundled module; an
+/// installed runtime is always consulted, so its failures stay testable.
+pub fn current_emulator(cx: &gpui::App) -> anyhow::Result<Arc<LoadedEmulator>> {
+    #[cfg(any(test, feature = "test-support"))]
+    if ggo_emu_wasm::EmuRuntime::global(cx).is_none() {
+        return Ok(tests_support::test_emulator());
+    }
+    ggo_emu_wasm::current_emulator(cx)
+}
+
 /// Start a run: spawn the emulator thread for `cart_path` and return its
 /// handle plus the receiver the panel pumps.
 ///
@@ -393,6 +386,7 @@ impl Drop for Session {
 /// never opens a device -- what the tests here use, so `cargo test` never
 /// touches the machine's audio hardware.
 pub fn start(
+    emulator: Arc<LoadedEmulator>,
     cart_path: PathBuf,
     cart: String,
     audio: Option<AudioStatus>,
@@ -430,7 +424,7 @@ pub fn start(
         std::thread::Builder::new()
             .name("ggo-emu-panel".into())
             .spawn(move || {
-                let result = run(&cart_path, &tx, &controls, &uart, audio.as_ref());
+                let result = run(&emulator, &cart_path, &tx, &controls, &uart, audio.as_ref());
                 uart.push_line(format!("[run ended] {}", result.reason));
                 // Here rather than inside `run`, so it covers every way
                 // out: the loop's own breaks AND the setup failures that
@@ -496,10 +490,11 @@ fn save_file_for(cart_path: &Path, title: &str, save_bytes: usize) -> Option<Pat
         return None;
     }
     let card_dir = cart_path.parent()?;
-    savefile::resolve_save_path(card_dir, title, save_bytes)
+    ggo_savefile::resolve_save_path(card_dir, title, save_bytes)
 }
 
 fn run(
+    emulator: &LoadedEmulator,
     cart_path: &Path,
     tx: &async_channel::Sender<Frame>,
     controls: &Controls,
@@ -536,68 +531,6 @@ fn run(
             };
         }
     };
-    let cart = match Cart::parse(&bytes) {
-        Ok(cart) => cart,
-        Err(e) => {
-            // Mirrors `CartStepper::drain_uart`'s one synthetic line: a
-            // cart that failed to load must say why in the console, not
-            // just vanish behind a status word.
-            uart.push_line(format!("[cart load failed] {e}"));
-            // The bytes are not a cart this emulator can load: a failure.
-            return RunOutcome {
-                reason: format!("cart: {e}"),
-                is_error: true,
-                perf: None,
-            };
-        }
-    };
-
-    let title = cart.header.title.clone();
-    // Split the die above the arena base between this cart's arena and its
-    // asset pools exactly as `run_cart` and the device OS do. Only the
-    // cart's own TOC sizes the pools: `run_cart` refuses to size them by
-    // scanning a card directory it was not explicitly given, and the pane
-    // never gives one -- neighbouring files in the cart's folder must not
-    // change the arena this cart is granted. Note the deliberate
-    // asymmetry with `set_card_dir` below: `asset_load` DOES resolve
-    // against the cart's directory at runtime. Loading from a directory
-    // and sizing a pool from it are different questions, and only the
-    // second one can silently change what the cart is granted.
-    let (vram_asset_bytes, ram_asset_bytes) =
-        ggo_emu_core::assets::pool_demand(cart.toc.as_deref(), None);
-    let plan = sandbox::plan(
-        sandbox::ARENA_MAX_LEN,
-        vram_asset_bytes,
-        ram_asset_bytes,
-        cart.header.ram_needed.max(sandbox::MIN_ARENA),
-    );
-    // The arena is per-cart now, so its size is no longer assumable from
-    // the outside -- report it the way `run_cart`'s banner does.
-    uart.push_line(format!(
-        "[ram] arena {} KiB, vram pool {} KiB, ram pool {} KiB",
-        plan.arena_len / 1024,
-        plan.vram_pool.1 / 1024,
-        plan.ram_pool.1 / 1024,
-    ));
-    let mut mmu = Mmu::with_plan(plan);
-    // There is no XIP flash any more: the loader copies the cart body into
-    // the PSRAM code window, which is what the OS does on device.
-    if !mmu.load_cart_body(&cart.body) {
-        uart.push_line(format!(
-            "[cart] body is {} bytes, larger than the {} byte code window; truncated",
-            cart.body.len(),
-            sandbox::XIP_LEN
-        ));
-    }
-    let mut cpu = Cpu::new(sandbox::XIP_BASE.wrapping_add(cart.header.entry_offset));
-    // ABI mode has no OS to program the PMP, so install the sandbox the OS
-    // installs before it jumps to a cart, exactly as `run_cart` and the
-    // wasm front end do. It is load-bearing, not ceremony: the flat
-    // `psram` backing bounds nothing by itself, and `cpu`'s PMP check
-    // short-circuits outside U-mode -- so without this an arena overrun or
-    // a store into the cart's own code window corrupts guest memory
-    // silently instead of halting the run.
-    ggo_emu_core::cpu::enter_sandbox(&mut cpu, &plan);
 
     // Same wall-clock RNG seed `run_cart` uses, so successive runs of the
     // same cart differ but a single run stays deterministic once started.
@@ -605,40 +538,60 @@ fn run(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    let mut p = Peripherals::new(seed, cart.header.save_bytes);
-    // The cache + wire perf sim, enabled exactly as `ggo-ide`'s
-    // `CartStepper::new` enables it (and as the browser/native cart runs
-    // do by default).
-    p.perf.enable();
-    // Attach a log sink so `log()` calls land in the pane's console (and
-    // from there the ingested `uart` table) instead of vanishing into
-    // this GUI process's invisible stdout -- mirrors `ggo-ide`'s
-    // `CartStepper::new` (see `Peripherals::log_sink`'s doc). Drained
-    // every turn below, alongside the rest of the loop's per-turn work.
-    p.log_sink = Some(Vec::new());
-    if let Some(toc) = cart.toc {
-        p.assets.set_toc(toc);
+    // The card dir is the cart's own directory, so `asset_load` resolves
+    // against it as it does for `run_cart`. Only the cart's own TOC sizes
+    // the asset pools: neighbouring files in the folder must not change
+    // the arena this cart is granted.
+    let mut emu = match emulator.start_cart(&bytes, seed, cart_path.parent().map(Path::to_path_buf))
+    {
+        Ok(emu) => emu,
+        Err(error) => {
+            // Mirrors `CartStepper::drain_uart`'s one synthetic line: a
+            // cart that failed to load must say why in the console, not
+            // just vanish behind a status word.
+            uart.push_line(format!("[cart load failed] {error}"));
+            // The bytes are not a cart this emulator can load: a failure.
+            return RunOutcome {
+                reason: format!("cart: {error}"),
+                is_error: true,
+                perf: None,
+            };
+        }
+    };
+    let info = emu.info().clone();
+    // The arena is per-cart, so its size is no longer assumable from the
+    // outside -- report it the way `run_cart`'s banner does.
+    uart.push_line(format!(
+        "[ram] arena {} KiB, vram pool {} KiB, ram pool {} KiB",
+        info.arena_len / 1024,
+        info.vram_pool / 1024,
+        info.ram_pool / 1024,
+    ));
+    if info.body_truncated {
+        uart.push_line("[cart] body is larger than the code window; truncated");
     }
-    // `asset_load` resolves relative to the cart's own directory, which
-    // is `run_cart`'s default when no `--card-dir` is given.
-    if let Some(dir) = cart_path.parent() {
-        p.assets.set_card_dir(dir.to_path_buf());
-    }
+
     // Save-file backing, the standalone's way (`run_cart`): load any
     // existing save now, flush on a dirty frame at most once a second and
     // once more on the way out.
-    let save_file = save_file_for(cart_path, &title, p.save.len());
+    let save_file = save_file_for(cart_path, &info.title, info.save_bytes);
     if let Some(path) = &save_file {
-        savefile::load_save(path, &title, &mut p.save);
+        let mut save = vec![0u8; info.save_bytes];
+        ggo_savefile::load_save(path, &info.title, &mut save);
+        if let Err(error) = emu.write_save(&save) {
+            uart.push_line(format!("[save] {error}"));
+        }
     }
     let mut last_save_flush: Option<u32> = None;
     let mut frames_presented: u32 = 0;
     let mut paused_total = Duration::ZERO;
-    if save_file.is_none() && !p.save.is_empty() {
+    if save_file.is_none() && info.save_bytes > 0 {
         uart.push_line(
             "[save] no save file could be resolved (every name probe is held by another cart's save); saves disabled",
         );
     }
+    let mut input_mask: u32 = 0;
+    let mut ticks_ms: u32 = 0;
 
     // Audio, last of the setup: AFTER the cart has parsed, so a cart that
     // never loads never opens a device at all, and immediately before the
@@ -655,7 +608,7 @@ fn run(
             // silence the incoming one. See `crate::audio`'s module doc.
             let (writer, reader) = crate::audio::channel(status.clone());
             // Infallible: no device is a normal machine, not a failed run.
-            let out = crate::audio::start_output(status, reader, ggo_emu_core::apu::MIX_RATE);
+            let out = crate::audio::start_output(status, reader, MIX_RATE);
             match &out {
                 Some(out) => uart.push_line(format!("[audio] {} Hz", out.device_rate)),
                 None => uart.push_line(format!(
@@ -699,36 +652,51 @@ fn run(
             break (WORLD_PANEL_STOP.to_string(), false);
         }
         let turn_started = Instant::now();
-        let (event, _insns) = run_until_event(&mut cpu, &mut mmu, &mut p, PER_TURN_BUDGET, false);
+        let event = emu.run_turn(input_mask, ticks_ms);
         // Drain every turn, regardless of what the turn ended with (Vsync,
         // Budget, Exit or Fault) -- not just on a completed frame. This is
         // the cadence `ggo-ide`'s `thread::run_loop` uses too
         // (`uart.push(&s.drain_uart())` once per `step`), and it is what
-        // keeps `Peripherals::log_sink` bounded: a cart that logs a lot
+        // keeps the module's log sink bounded: a cart that logs a lot
         // between vsync waits (or never reaches one) can't grow the sink
         // past one turn's worth of bytes.
-        uart.push(&p.take_log());
+        match emu.take_log() {
+            Ok(log) => uart.push(&log),
+            Err(error) => break emulator_failure(error),
+        }
         match event {
             // Frame boundary: the cart drew a complete frame and called
             // vsync_wait. Publish it, pace, then latch input --
             // `run_cart`'s Vsync arm, minus the present and the stall.
-            FrameEvent::Vsync(number) => {
-                let bgra = rgb565_to_bgra(&p.default_fb);
+            TurnEvent::Vsync(number) => {
+                let bgra = match emu.framebuffer_bgra() {
+                    Ok(bgra) => bgra,
+                    Err(error) => break emulator_failure(error),
+                };
                 let step_ms = turn_started.elapsed().as_secs_f32() * MILLIS_PER_SEC;
                 // BEFORE the frame goes out: the snapshot describes this
                 // frame, and the pane reads it on the frame's arrival.
-                publish_snapshot(&p.ppu, snapshot);
-                if inspect.load(Ordering::Acquire) {
-                    arm_world_tap(&mut mmu, &mut tap_addr, true);
+                match emu.ppu_snapshot() {
+                    Ok(ppu) => *snapshot.lock().unwrap() = Some(Arc::new(ppu)),
+                    Err(error) => break emulator_failure(error),
                 }
-                publish_world_tap(&mmu, &mut tap_addr, world_json);
+                let arm_tap = inspect.load(Ordering::Acquire);
+                if let Err(error) = emu.with_arena(|arena| {
+                    if arm_tap {
+                        arm_world_tap(arena, &mut tap_addr, true);
+                    }
+                    publish_world_tap(arena, &mut tap_addr, world_json);
+                }) {
+                    break emulator_failure(error);
+                }
                 // A link this run has handed over (see
                 // `Session::release_link`) is not this run's to touch:
                 // its outbound queue now belongs to the next run.
                 if let Some(link) = link
                     && link_owned.load(Ordering::Acquire)
+                    && let Err(error) = crate::link::pump_link(&mut emu, link, &mut link_reader)
                 {
-                    crate::link::pump_link(&mut p, link, &mut link_reader);
+                    break emulator_failure(error);
                 }
                 // Full channel = the UI hasn't drained the previous
                 // frame yet; drop this one. Closed = the panel dropped
@@ -744,29 +712,42 @@ fn run(
                     break ("stopped".to_string(), false);
                 }
                 // BEFORE the pacing hold, so the ring is fed as early in
-                // the period as it can be. `handle_vsync_wait` advanced
-                // the APU exactly one frame on the way to this event, so
-                // there is precisely one frame of samples waiting.
+                // the period as it can be. The module advanced the APU
+                // exactly one frame on the way to this event, so there is
+                // precisely one frame of samples waiting.
                 let speed = speed.load(Ordering::Acquire).clamp(1, MAX_SPEED);
                 if let Some(writer) = &audio_writer {
-                    audio_cursor = if speed == 1 {
-                        pump_audio(&p.apu, audio_cursor, &mut audio_scratch, writer)
+                    let copied = if speed == 1 {
+                        pump_audio(
+                            |cursor, out| emu.audio_copy_since(cursor, out),
+                            audio_cursor,
+                            &mut audio_scratch,
+                            writer,
+                        )
                     } else {
                         // Silence at speed: the ring would drop most of
                         // it anyway, and what got through would be noise.
                         // The cursor still advances so 1x resumes clean.
                         audio_scratch.clear();
-                        p.apu.copy_since(audio_cursor, &mut audio_scratch)
+                        emu.audio_copy_since(audio_cursor, &mut audio_scratch)
                     };
+                    match copied {
+                        Ok(cursor) => audio_cursor = cursor,
+                        Err(error) => break emulator_failure(error),
+                    }
                 }
                 frames_presented = frames_presented.wrapping_add(1);
-                if p.save_dirty
-                    && last_save_flush.is_none_or(|f| {
-                        frames_presented.wrapping_sub(f) >= savefile::FLUSH_INTERVAL_FRAMES
-                    })
-                {
-                    flush_save(&save_file, &title, &mut p, uart);
-                    last_save_flush = Some(frames_presented);
+                match emu.save_dirty() {
+                    Ok(true)
+                        if last_save_flush.is_none_or(|f| {
+                            frames_presented.wrapping_sub(f) >= ggo_savefile::FLUSH_INTERVAL_FRAMES
+                        }) =>
+                    {
+                        flush_save(&save_file, &info.title, &mut emu, uart);
+                        last_save_flush = Some(frames_presented);
+                    }
+                    Ok(_) => {}
+                    Err(error) => break emulator_failure(error),
                 }
                 if let Some(hold) = pace_sleep(last_present.elapsed(), FRAME_TIME / speed) {
                     std::thread::sleep(hold);
@@ -796,9 +777,9 @@ fn run(
                 // at the START of the frame it is about to run, not as it
                 // was ~16 ms earlier. Latching before the sleep costs a
                 // whole frame of input latency.
-                p.input_mask = input.load(Ordering::Acquire);
+                input_mask = input.load(Ordering::Acquire);
                 // AFTER the hold and the input latch -- `ggo-emu/src/
-                // lib.rs`'s Vsync arm calls `set_ticks_ms` last too
+                // lib.rs`'s Vsync arm sets the ticks last too
                 // (present -> refresh_input -> set_ticks_ms), so the
                 // clock the cart reads next turn accounts for the pacing
                 // sleep it just went through.
@@ -809,14 +790,14 @@ fn run(
                     FRAME_TIME
                 };
                 last_real = real;
-                p.set_ticks_ms(emulated.as_millis().min(u32::MAX as u128) as u32);
+                ticks_ms = emulated.as_millis().min(u32::MAX as u128) as u32;
             }
             // Budget exhausted mid-frame: the framebuffer is half-drawn,
             // so do NOT publish it (`run_cart` likewise refuses to
             // present a partial buffer). Latch input and go round again;
             // the `stop` check at the top of the loop is what keeps this
             // interruptible for a cart that never reaches vsync_wait.
-            FrameEvent::Budget => {
+            TurnEvent::Budget => {
                 // A cart that never reaches vsync_wait still honours pause
                 // (no frame to publish or snapshot, but it parks).
                 let (parked, parked_stop) = park_while_paused(
@@ -833,33 +814,18 @@ fn run(
                     // whichever of the two asked for it.
                     break (reason.to_string(), false);
                 }
-                p.input_mask = input.load(Ordering::Acquire);
+                input_mask = input.load(Ordering::Acquire);
             }
             // The cart called exit: an ordinary end however it scores
             // itself, so NOT an error even for a non-zero code -- the code
             // is the cart's verdict on its own work, and the pane already
             // shows it in the reason.
-            FrameEvent::Exit(code) => break (format!("cart exited with {code}"), false),
-            // The whole die is backed and the sandbox's arena entry ends
-            // exactly at the granted arena, so a stack or heap that runs
-            // off the end arrives as a PMP fault rather than an unmapped
-            // access. `run_cart` names that case rather than reporting a
-            // generic escape, and so must the pane -- it is the commonest
-            // way a cart dies, and the arena it overran is per-cart.
-            FrameEvent::Fault(Trap::PmpFault { pc, addr, access })
-                if ggo_emu_core::mmu::is_arena_overrun(&plan, addr, access) =>
-            {
-                break (
-                    format!(
-                        "out of memory: cart accessed {addr:#010x} past its {}-byte RAM arena at pc={pc:#010x}",
-                        plan.arena_len
-                    ),
-                    true,
-                );
-            }
-            // The CPU trapped (bad instruction, bad access): the run died,
-            // which is an error however the cart got there.
-            FrameEvent::Fault(trap) => break (format!("cpu fault: {trap:?}"), true),
+            TurnEvent::Exit(code) => break (format!("cart exited with {code}"), false),
+            // The module words both the arena overrun ("out of memory:
+            // ...", the commonest way a cart dies) and any other CPU trap;
+            // either way the run died, which is an error however the cart
+            // got there.
+            TurnEvent::Fault(reason) => break (reason, true),
         }
     };
 
@@ -871,48 +837,41 @@ fn run(
     // (`RingWriter::drop` is still what covers the panic path -- see its
     // doc; this is only about making the clean path prompt.)
     drop(audio_writer);
-    if p.save_dirty {
-        flush_save(&save_file, &title, &mut p, uart);
+    match emu.save_dirty() {
+        Ok(true) => flush_save(&save_file, &info.title, &mut emu, uart),
+        Ok(false) => {}
+        Err(error) => uart.push_line(format!("[save] {error}")),
     }
 
+    // `idump`/`ddump` are absent for the reason `ggo-ide` gives:
+    // function-level I$/D$ attribution needs the cart's companion ELF and
+    // tooling that lives above the emulator. The perf JSON simply omits the
+    // optional `"profile"`/`"dprofile"` sections, which
+    // `ingest::parse_output` treats as "no rows", not an error.
+    let perf = match (emu.perf_json(), emu.perf_frames()) {
+        (Ok(perf_json), Ok(frames)) => Some(PerfSnapshot {
+            cart: info.title,
+            perf_json,
+            frames,
+        }),
+        (Err(error), _) | (_, Err(error)) => {
+            uart.push_line(format!("[perf] {error}"));
+            None
+        }
+    };
     RunOutcome {
         reason,
         is_error,
-        perf: Some(PerfSnapshot {
-            cart: title,
-            // `ggo-ide`'s `CartStepper::perf_json`, argument for
-            // argument. `idump`/`ddump` are `None` for the same reason it
-            // gives: function-level I$/D$ attribution needs the cart's
-            // companion ELF and the `ggo-emu` `profile` module's
-            // DWARF/addr2line tooling, which lives one level above
-            // `ggo-emu-core` and is not a dependency here. The perf JSON
-            // simply omits the optional `"profile"`/`"dprofile"`
-            // sections, which `ingest::parse_output` treats as "no rows",
-            // not an error.
-            perf_json: ggo_emu_core::perfsim::perf_json(
-                &cart.header.title,
-                &p.perf.frames,
-                p.perf.wire_wait,
-                None,
-                None,
-            ),
-            frames: p.perf.frames.len() as u64,
-        }),
+        perf,
     }
 }
 
-/// Move every APU sample mixed since `cursor` into `writer`, returning the
-/// new cursor -- the whole audio contribution of one presented frame.
-///
-/// Factored out of [`run`] rather than inlined so it can be driven against
-/// a real `Apu` with no output device anywhere in sight (see this module's
-/// tests): everything about whether the emulated APU's samples actually
-/// reach the ring is here, and nothing about it needs cpal.
-///
-/// `scratch` is reused across frames to avoid a per-frame allocation, and
-/// is cleared here rather than by `Apu::copy_since` -- that method
-/// *appends* (`out.reserve` + `out.push`), so a caller that forgets would
-/// re-push every previous frame's samples on top of the new ones.
+/// How an emulator-module call that errors (a trap inside the module, a
+/// malformed hand-off) ends the run: always a failure.
+fn emulator_failure(error: anyhow::Error) -> (String, bool) {
+    (format!("emulator: {error}"), true)
+}
+
 /// Hold while `pause` is set: returns `(time parked, stop requested)`.
 /// Checks `stop` first on every turn so a paused run still stops within
 /// one frame time; one queued `step` releases exactly one turn. The audio
@@ -965,37 +924,53 @@ fn world_panel_stop_requested(link: Option<&Arc<LinkEndpoint>>, link_owned: &Ato
     link.is_some_and(|link| link_owned.load(Ordering::Acquire) && link.stop_requested())
 }
 
-/// Refill the debugger's snapshot slot from the PPU. Reuses the previous
-/// snapshot's buffers when the pane has let go of it, so a run with no
-/// viewer open costs one ~138 KB memcpy per frame and no allocation.
-fn publish_snapshot(ppu: &ggo_emu_core::ppu::Ppu, slot: &Mutex<Option<Arc<PpuSnapshot>>>) {
-    let mut slot = slot.lock().unwrap();
-    let mut snap = slot
-        .take()
-        .and_then(|arc| Arc::try_unwrap(arc).ok())
-        .unwrap_or_default();
-    ppu.snapshot_into(&mut snap);
-    *slot = Some(Arc::new(snap));
-}
-
-/// Write the save region to its file, clearing `save_dirty` on success.
-/// A failure is a console line, not a run failure -- the standalone
-/// prints and carries on the same way.
-fn flush_save(save_file: &Option<PathBuf>, title: &str, p: &mut Peripherals, uart: &UartLog) {
+/// Write the save region to its file, clearing the module's dirty flag on
+/// success. A failure is a console line, not a run failure -- the
+/// standalone prints and carries on the same way.
+fn flush_save(save_file: &Option<PathBuf>, title: &str, emu: &mut WasmEmu, uart: &UartLog) {
     let Some(path) = save_file else {
         return;
     };
-    match savefile::flush_save(path, title, &p.save) {
-        Ok(()) => p.save_dirty = false,
+    let save = match emu.save_bytes() {
+        Ok(save) => save,
+        Err(error) => {
+            uart.push_line(format!("[save] {error}"));
+            return;
+        }
+    };
+    match ggo_savefile::flush_save(path, title, &save) {
+        Ok(()) => {
+            if let Err(error) = emu.clear_save_dirty() {
+                uart.push_line(format!("[save] {error}"));
+            }
+        }
         Err(e) => uart.push_line(format!("[save] flush {} failed: {e}", path.display())),
     }
 }
 
-fn pump_audio(apu: &Apu, cursor: u64, scratch: &mut Vec<i16>, writer: &RingWriter) -> u64 {
+/// Move every APU sample mixed since `cursor` into `writer`, returning the
+/// new cursor -- the whole audio contribution of one presented frame.
+///
+/// Factored out of [`run`] rather than inlined so it can be driven against
+/// a real emulated APU with no output device anywhere in sight (see this
+/// module's tests): everything about whether the emulated APU's samples
+/// actually reach the ring is here, and nothing about it needs cpal.
+///
+/// `copy_since` is `WasmEmu::audio_copy_since` in a run. `scratch` is reused
+/// across frames to avoid a per-frame allocation, and is cleared here
+/// rather than by it -- that method
+/// *appends*, so a caller that forgets would re-push every previous
+/// frame's samples on top of the new ones.
+fn pump_audio(
+    copy_since: impl FnOnce(u64, &mut Vec<i16>) -> anyhow::Result<u64>,
+    cursor: u64,
+    scratch: &mut Vec<i16>,
+    writer: &RingWriter,
+) -> anyhow::Result<u64> {
     scratch.clear();
-    let next = apu.copy_since(cursor, scratch);
+    let next = copy_since(cursor, scratch)?;
     writer.push(scratch);
-    next
+    Ok(next)
 }
 
 /// How long to hold a just-published frame, given `elapsed` since the
@@ -1034,12 +1009,10 @@ fn find_tap(ram: &[u8], tap_addr: &mut Option<usize>) -> Option<usize> {
 
 /// Arm (or disarm) the cart's tap by writing its `enabled` word — the
 /// host-side switch that makes serialization cost nothing in ordinary
-/// runs. No-op for carts without a tap.
-fn arm_world_tap(mmu: &mut ggo_emu_core::mmu::Mmu, tap_addr: &mut Option<usize>, on: bool) {
-    let bounds = arena_range(mmu);
-    let Some(arena) = mmu.psram.get_mut(bounds) else {
-        return;
-    };
+/// runs. No-op for carts without a tap. `arena` is the cart's writable
+/// RAM arena, which the SDK linker anchors `.data`/`.bss` at the base of,
+/// so it is the window the tap static can be in.
+fn arm_world_tap(arena: &mut [u8], tap_addr: &mut Option<usize>, on: bool) {
     let Some(addr) = find_tap(arena, tap_addr) else {
         return;
     };
@@ -1049,26 +1022,13 @@ fn arm_world_tap(mmu: &mut ggo_emu_core::mmu::Mmu, tap_addr: &mut Option<usize>,
     }
 }
 
-/// The cart's writable arena, as a range into [`Mmu::psram`]. The SDK
-/// linker anchors `.data`/`.bss` at the arena base, so this is the window
-/// the tap static can be in -- and its length is per-cart now, not a
-/// constant: whatever the RAM plan did not hand to the asset pools.
-fn arena_range(mmu: &ggo_emu_core::mmu::Mmu) -> std::ops::Range<usize> {
-    let start = (sandbox::ARENA_BASE - sandbox::PSRAM_BASE) as usize;
-    let end = (mmu.plan.arena_end() - sandbox::PSRAM_BASE) as usize;
-    start..end
-}
-
 /// Copy the cart's world-inspection JSON (if armed and written) out of
 /// guest RAM into the session slot.
 fn publish_world_tap(
-    mmu: &ggo_emu_core::mmu::Mmu,
+    ram: &[u8],
     tap_addr: &mut Option<usize>,
     slot: &Mutex<Option<(u32, Arc<String>)>>,
 ) {
-    let Some(ram) = mmu.psram.get(arena_range(mmu)) else {
-        return;
-    };
     let Some(addr) = find_tap(ram, tap_addr) else {
         return; // cart built without the inspect feature
     };
@@ -1088,46 +1048,39 @@ fn publish_world_tap(
     *slot.lock().unwrap() = Some((seq, Arc::new(json)));
 }
 
-/// RGB565 framebuffer -> BGRA8, gpui's `RenderImage` frame format.
-///
-/// The 5/6-bit -> 8-bit expansion is `ggo_emu::dump_ppm`'s (replicate the
-/// high bits into the low ones, so 0x1F -> 0xFF rather than 0xF8), and the
-/// channel order is `ggo_common::rgba_to_bgra`'s target. Done on the
-/// emulator thread so the UI thread only ever wraps an already-correct
-/// buffer -- `image::ImageBuffer::from_raw` takes the `Vec` by value, so
-/// there is no second copy anywhere in the path.
-pub fn rgb565_to_bgra(fb: &[u16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(fb.len() * 4);
-    for &px in fb {
-        let r5 = (px >> 11) & 0x1F;
-        let g6 = (px >> 5) & 0x3F;
-        let b5 = px & 0x1F;
-        out.push(((b5 << 3) | (b5 >> 2)) as u8);
-        out.push(((g6 << 2) | (g6 >> 4)) as u8);
-        out.push(((r5 << 3) | (r5 >> 2)) as u8);
-        out.push(0xFF);
-    }
-    out
-}
-
 #[cfg(any(test, feature = "test-support"))]
 pub use ggo_emu_wasm::fixture;
 
 /// Helpers other modules' tests drive a real run through.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod tests_support {
     use super::*;
+
+    /// The bundled emulator module, compiled once per test process --
+    /// compiling is the slow part and every run shares the result.
+    pub fn test_emulator() -> Arc<LoadedEmulator> {
+        static EMULATOR: std::sync::OnceLock<Arc<LoadedEmulator>> = std::sync::OnceLock::new();
+        EMULATOR
+            .get_or_init(|| {
+                Arc::new(
+                    LoadedEmulator::compile(ggo_emu_wasm::BUNDLED_WASM, "bundled")
+                        .expect("the bundled emulator compiles"),
+                )
+            })
+            .clone()
+    }
 
     /// Run the green fixture cart until `frames` frames have arrived,
     /// then stop it and return the finished run -- perf snapshot and all.
     /// Used by `crate::ingest`'s tests to ingest genuinely-emitted perf
     /// JSON rather than a hand-written imitation of it.
+    #[cfg(test)]
     pub fn run_green_cart_briefly(frames: usize) -> FinishedRun {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("green.cart");
         std::fs::write(&path, fixture::green_screen_cart()).unwrap();
 
-        let (session, rx) = start(path, "green.cart".to_string(), None, None);
+        let (session, rx) = start(test_emulator(), path, "green.cart".to_string(), None, None);
         for _ in 0..frames {
             rx.recv_blocking().expect("the emulator thread must run");
         }
@@ -1148,6 +1101,7 @@ mod tests {
     #[test]
     fn set_speed_clamps_to_the_supported_range() {
         let (session, _rx) = start(
+            tests_support::test_emulator(),
             PathBuf::from("/nonexistent/cart.ggo"),
             "cart.ggo".into(),
             None,
@@ -1206,37 +1160,11 @@ mod tests {
         assert!((fps - 60.0).abs() < 0.01, "{fps} fps");
     }
 
-    // -------------------------------------------------- pixel conversion
-
-    #[test]
-    fn rgb565_to_bgra_expands_channels_and_orders_them_bgra() {
-        // Pure red, pure green, pure blue, black, white.
-        let fb = vec![0xF800u16, 0x07E0, 0x001F, 0x0000, 0xFFFF];
-        let out = rgb565_to_bgra(&fb);
-        assert_eq!(out.len(), fb.len() * 4);
-        assert_eq!(&out[0..4], &[0x00, 0x00, 0xFF, 0xFF], "red -> B,G,R,A");
-        assert_eq!(&out[4..8], &[0x00, 0xFF, 0x00, 0xFF], "green");
-        assert_eq!(&out[8..12], &[0xFF, 0x00, 0x00, 0xFF], "blue");
-        assert_eq!(&out[12..16], &[0x00, 0x00, 0x00, 0xFF], "black");
-        assert_eq!(
-            &out[16..20],
-            &[0xFF, 0xFF, 0xFF, 0xFF],
-            "white must reach 0xFF, not 0xF8 -- the high bits replicate"
-        );
-    }
-
-    #[test]
-    fn rgb565_to_bgra_is_always_opaque_and_screen_sized() {
-        let out = rgb565_to_bgra(&vec![0x1234u16; (WIDTH * HEIGHT) as usize]);
-        assert_eq!(out.len(), (WIDTH * HEIGHT * 4) as usize);
-        assert!(out.chunks_exact(4).all(|px| px[3] == 0xFF));
-    }
-
     // ------------------------------------------------------- the sandbox
 
     /// The cart PMP is what bounds the arena now -- the flat `psram`
     /// backing does not -- so a cart that stores past the arena it was
-    /// granted must halt, and halt saying so. Without `enter_sandbox` the
+    /// granted must halt, and halt saying so. Without the module's sandbox the
     /// store lands silently and the cart paints green forever, which is
     /// exactly what the `is_err` assertion catches (a frame arriving at
     /// all means no fault fired).
@@ -1246,7 +1174,13 @@ mod tests {
         let path = dir.path().join("overrun.ggo");
         std::fs::write(&path, fixture::overrun_cart()).unwrap();
 
-        let (session, rx) = start(path, "overrun.ggo".into(), None, None);
+        let (session, rx) = start(
+            tests_support::test_emulator(),
+            path,
+            "overrun.ggo".into(),
+            None,
+            None,
+        );
         assert!(
             rx.recv_blocking().is_err(),
             "the run must die on its first store, never reaching a frame"
@@ -1266,39 +1200,54 @@ mod tests {
 
     // ------------------------------------------------------- the audio tap
     //
-    // These drive a REAL `ggo_emu_core::apu::Apu` -- the same type a cart
-    // run mixes into -- straight into a real `RingWriter`, with no output
-    // device anywhere. That is the whole point: every machine can run
-    // them, including one with no sound card, and they still prove the
-    // emulated APU's samples reach the ring the cpal callback drains.
+    // These drive a REAL emulated APU -- the module's standalone `WasmApu`,
+    // the same mixer a cart run uses -- straight into a real `RingWriter`,
+    // with no output device anywhere. That is the whole point: every
+    // machine can run them, including one with no sound card, and they
+    // still prove the emulated APU's samples reach the ring the cpal
+    // callback drains.
 
-    /// Sound one PSG square at full volume and advance the APU one frame,
-    /// exactly as `runtime::handle_vsync_wait` does on every presented
-    /// frame. `(ch=8, step=1.0x, vol=full both, ctrl=enable|duty50)` is
-    /// `ggo-emu-core`'s own `audio_psg_note_on_off_via_syscalls` fixture.
-    fn apu_with_one_mixed_frame() -> Apu {
-        let mut apu = Apu::new();
-        apu.set_channel(8, 0x1000, 0xFFFF, 0b101);
-        apu.run_frame();
+    /// Play one full-volume clip and advance the APU one frame, as the
+    /// module does on every presented frame.
+    fn apu_with_one_mixed_frame() -> ggo_emu_wasm::WasmApu {
+        let mut apu = tests_support::test_emulator()
+            .new_apu()
+            .expect("the apu instantiates");
+        apu.queue_samples(0, &[0x11u8; 64])
+            .expect("the clip queues");
+        apu.play_sample(
+            0,
+            0,
+            64,
+            ggo_emu_abi::ONE_SHOT,
+            0x1000 | (0xFF << 16) | (0xFF << 24),
+            0,
+        )
+        .expect("the clip plays");
+        apu.run_frame().expect("the frame mixes");
+        let mut mixed = Vec::new();
+        apu.copy_since(0, &mut mixed).expect("the ring reads");
         assert!(
-            apu.ring().iter().any(|&s| s != 0),
-            "sanity: the fixture note must actually be audible"
+            mixed.iter().any(|&s| s != 0),
+            "sanity: the fixture clip must actually be audible"
         );
         apu
     }
 
     #[test]
     fn pump_audio_moves_a_frames_mixed_samples_into_the_ring() {
-        let apu = apu_with_one_mixed_frame();
+        let mut apu = apu_with_one_mixed_frame();
         let status = crate::audio::AudioStatus::new();
         let (writer, reader) = crate::audio::channel(status);
 
         let mut scratch = Vec::new();
-        let cursor = pump_audio(&apu, 0, &mut scratch, &writer);
+        let cursor = pump_audio(|c, out| apu.copy_since(c, out), 0, &mut scratch, &writer)
+            .expect("the pump succeeds");
 
+        let mut everything = Vec::new();
         assert_eq!(
             cursor,
-            apu.write_cursor(),
+            apu.copy_since(0, &mut everything).unwrap(),
             "the returned cursor must be caught up to the APU's writer"
         );
         assert!(
@@ -1307,7 +1256,7 @@ mod tests {
         );
         assert!(
             scratch.iter().any(|&s| s != 0),
-            "the note must survive the copy, not arrive as silence"
+            "the clip must survive the copy, not arrive as silence"
         );
         assert_eq!(
             reader.queued_len(),
@@ -1318,7 +1267,7 @@ mod tests {
 
     /// The cursor is what keeps one frame's samples from being submitted
     /// twice -- and `scratch` being reused across frames is exactly why
-    /// [`pump_audio`] has to clear it (`Apu::copy_since` appends).
+    /// [`pump_audio`] has to clear it (`copy_since` appends).
     #[test]
     fn pump_audio_submits_each_frame_once_across_a_reused_scratch_buffer() {
         let mut apu = apu_with_one_mixed_frame();
@@ -1326,12 +1275,19 @@ mod tests {
         let (writer, reader) = crate::audio::channel(status);
 
         let mut scratch = Vec::new();
-        let cursor = pump_audio(&apu, 0, &mut scratch, &writer);
+        let cursor = pump_audio(|c, out| apu.copy_since(c, out), 0, &mut scratch, &writer)
+            .expect("the pump succeeds");
         let first_frame = reader.queued_len();
 
         // Nothing new mixed: a second pump at the same cursor submits
         // nothing, rather than re-submitting the frame just sent.
-        let cursor = pump_audio(&apu, cursor, &mut scratch, &writer);
+        let cursor = pump_audio(
+            |c, out| apu.copy_since(c, out),
+            cursor,
+            &mut scratch,
+            &writer,
+        )
+        .expect("the pump succeeds");
         assert_eq!(
             reader.queued_len(),
             first_frame,
@@ -1341,12 +1297,19 @@ mod tests {
         // One more mixed frame: exactly that frame's samples are added.
         // Not `first_frame * 2` -- the APU's mix rate is not an exact
         // multiple of 60, so consecutive frames differ by a sample.
-        apu.run_frame();
-        let mixed = (apu.write_cursor() - cursor) as usize;
-        pump_audio(&apu, cursor, &mut scratch, &writer);
+        apu.run_frame().expect("the frame mixes");
+        let mut mixed = Vec::new();
+        apu.copy_since(cursor, &mut mixed).expect("the ring reads");
+        pump_audio(
+            |c, out| apu.copy_since(c, out),
+            cursor,
+            &mut scratch,
+            &writer,
+        )
+        .expect("the pump succeeds");
         assert_eq!(
             reader.queued_len(),
-            first_frame + mixed,
+            first_frame + mixed.len(),
             "the second frame adds exactly its own samples and no copy of the first"
         );
     }
@@ -1356,23 +1319,26 @@ mod tests {
     /// but nothing is submitted.
     #[test]
     fn pump_audio_submits_nothing_while_muted() {
-        let apu = apu_with_one_mixed_frame();
+        let mut apu = apu_with_one_mixed_frame();
         let status = crate::audio::AudioStatus::new();
         status.set_muted(true);
         let (writer, reader) = crate::audio::channel(status.clone());
 
         let mut scratch = Vec::new();
-        let cursor = pump_audio(&apu, 0, &mut scratch, &writer);
+        let cursor = pump_audio(|c, out| apu.copy_since(c, out), 0, &mut scratch, &writer)
+            .expect("the pump succeeds");
         assert_eq!(reader.queued_len(), 0, "a muted run submits no frames");
+        let mut everything = Vec::new();
         assert_eq!(
             cursor,
-            apu.write_cursor(),
+            apu.copy_since(0, &mut everything).unwrap(),
             "the cursor still advances, so unmuting resumes from live \
              audio rather than replaying what was mixed while silent"
         );
 
         status.set_muted(false);
-        pump_audio(&apu, 0, &mut scratch, &writer);
+        pump_audio(|c, out| apu.copy_since(c, out), 0, &mut scratch, &writer)
+            .expect("the pump succeeds");
         assert!(reader.queued_len() > 0, "unmuting resumes submission");
     }
 
@@ -1388,7 +1354,13 @@ mod tests {
         let path = dir.path().join("green.cart");
         std::fs::write(&path, green_screen_cart()).unwrap();
 
-        let (session, rx) = start(path, "green.cart".to_string(), None, None);
+        let (session, rx) = start(
+            tests_support::test_emulator(),
+            path,
+            "green.cart".to_string(),
+            None,
+            None,
+        );
 
         let mut frames = Vec::new();
         // Five frames at 60 Hz is ~83 ms of pacing; the recv itself
@@ -1450,7 +1422,13 @@ mod tests {
         let path = dir.path().join("green.cart");
         std::fs::write(&path, green_screen_cart()).unwrap();
 
-        let (session, rx) = start(path, "green.cart".to_string(), None, None);
+        let (session, rx) = start(
+            tests_support::test_emulator(),
+            path,
+            "green.cart".to_string(),
+            None,
+            None,
+        );
         // Prove the run is genuinely live before dropping the handle.
         rx.recv_blocking().expect("the emulator thread must run");
 
@@ -1523,7 +1501,13 @@ mod tests {
         let path = dir.path().join("junk.cart");
         std::fs::write(&path, b"not a cart at all").unwrap();
 
-        let (session, rx) = start(path, "junk.cart".to_string(), None, None);
+        let (session, rx) = start(
+            tests_support::test_emulator(),
+            path,
+            "junk.cart".to_string(),
+            None,
+            None,
+        );
         assert!(
             rx.recv_blocking().is_err(),
             "junk must not produce a frame; the channel just closes"
@@ -1551,6 +1535,7 @@ mod tests {
     #[test]
     fn a_missing_cart_file_ends_with_a_reason() {
         let (session, rx) = start(
+            tests_support::test_emulator(),
             "/definitely/not/here.cart".into(),
             "here.cart".to_string(),
             None,
@@ -1570,6 +1555,7 @@ mod tests {
     fn a_run_started_for_a_link_leaves_it_stopped_with_the_runs_reason() {
         let endpoint = LinkEndpoint::new();
         let (session, rx) = start(
+            tests_support::test_emulator(),
             "/definitely/not/here.cart".into(),
             "here.cart".to_string(),
             None,
@@ -1593,7 +1579,13 @@ mod tests {
         std::fs::write(&path, fixture::comm_echo_cart()).unwrap();
 
         let endpoint = LinkEndpoint::new();
-        let (session, rx) = start(path, "echo.cart".to_string(), None, Some(endpoint.clone()));
+        let (session, rx) = start(
+            tests_support::test_emulator(),
+            path,
+            "echo.cart".to_string(),
+            None,
+            Some(endpoint.clone()),
+        );
         endpoint
             .send_app(b"ping")
             .expect("a four-byte payload fits");
@@ -1662,7 +1654,13 @@ mod tests {
         std::fs::write(&path, green_screen_cart()).unwrap();
 
         let endpoint = LinkEndpoint::new();
-        let (session, rx) = start(path, "green.cart".to_string(), None, Some(endpoint.clone()));
+        let (session, rx) = start(
+            tests_support::test_emulator(),
+            path,
+            "green.cart".to_string(),
+            None,
+            Some(endpoint.clone()),
+        );
         rx.recv_blocking().expect("the emulator thread must run");
         session.pause();
         // Long enough for the thread to reach the park and settle there:
@@ -1698,7 +1696,13 @@ mod tests {
         std::fs::write(&path, green_screen_cart()).unwrap();
 
         let endpoint = LinkEndpoint::new();
-        let (session, rx) = start(path, "green.cart".to_string(), None, Some(endpoint.clone()));
+        let (session, rx) = start(
+            tests_support::test_emulator(),
+            path,
+            "green.cart".to_string(),
+            None,
+            Some(endpoint.clone()),
+        );
         rx.recv_blocking().expect("the emulator thread must run");
         session.release_link();
 
@@ -1738,7 +1742,13 @@ mod tests {
         let path = dir.path().join("quit.cart");
         std::fs::write(&path, image).unwrap();
 
-        let (session, rx) = start(path, "quit.cart".to_string(), None, None);
+        let (session, rx) = start(
+            tests_support::test_emulator(),
+            path,
+            "quit.cart".to_string(),
+            None,
+            None,
+        );
         // Let the run reach its own terminus first. `wait` sets the stop
         // flag before it joins (it is the "finish this run" call, not a
         // passive read), so racing it against the cart would report
@@ -1763,11 +1773,9 @@ mod tests {
         );
     }
 
-    /// End-to-end: a REAL guest `log()` ecall -- not a value poked
-    /// directly into `Peripherals::log_sink` -- reaches the pane's
-    /// console. Proves the whole chain `run`'s sink attachment ->
-    /// `Syscall::Log`'s handler -> the per-turn `uart.push(&p.take_log())`
-    /// drain -> [`crate::uart::UartLog`] -> what [`Session::wait`] hands
+    /// End-to-end: a REAL guest `log()` ecall reaches the pane's console.
+    /// Proves the whole chain the module's log sink -> the per-turn
+    /// `uart.push(&emu.take_log())` drain -> [`crate::uart::UartLog`] -> what [`Session::wait`] hands
     /// back for ingest.
     #[test]
     fn a_carts_own_log_call_reaches_the_console() {
@@ -1777,7 +1785,13 @@ mod tests {
         let path = dir.path().join("logging.cart");
         std::fs::write(&path, logging_cart()).unwrap();
 
-        let (session, rx) = start(path, "logging.cart".to_string(), None, None);
+        let (session, rx) = start(
+            tests_support::test_emulator(),
+            path,
+            "logging.cart".to_string(),
+            None,
+            None,
+        );
         // The cart's single `log()` call runs on the very first turn,
         // before its first `vsync_wait` -- so by the time the first frame
         // arrives, that turn's drain has already moved it into the
@@ -1802,7 +1816,13 @@ mod tests {
         let path = dir.path().join("green.cart");
         std::fs::write(&path, green_screen_cart()).unwrap();
 
-        let (session, rx) = start(path, "green.cart".to_string(), None, None);
+        let (session, rx) = start(
+            tests_support::test_emulator(),
+            path,
+            "green.cart".to_string(),
+            None,
+            None,
+        );
         // Wait for the run to be genuinely under way before publishing,
         // so the store can't race the thread's construction.
         rx.recv_blocking().unwrap();
@@ -1839,7 +1859,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("green.cart");
         std::fs::write(&path, green_screen_cart()).unwrap();
-        let (session, rx) = start(path, "green.cart".to_string(), None, None);
+        let (session, rx) = start(
+            tests_support::test_emulator(),
+            path,
+            "green.cart".to_string(),
+            None,
+            None,
+        );
 
         let first = rx.recv_blocking().expect("frames flow before pause");
         assert!(
@@ -1914,7 +1940,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("green.cart");
         std::fs::write(&path, green_screen_cart()).unwrap();
-        let (session, rx) = start(path, "green.cart".to_string(), None, None);
+        let (session, rx) = start(
+            tests_support::test_emulator(),
+            path,
+            "green.cart".to_string(),
+            None,
+            None,
+        );
         rx.recv_blocking().expect("running");
         session.step();
         assert_eq!(session.step.load(Ordering::Acquire), 0);
@@ -1932,13 +1964,19 @@ mod tests {
         let cart_bytes = fixture::saving_cart();
         let path = card_dir.join("save.cart");
         std::fs::write(&path, &cart_bytes).unwrap();
-        let (session, rx) = start(path, "save.cart".to_string(), None, None);
+        let (session, rx) = start(
+            tests_support::test_emulator(),
+            path,
+            "save.cart".to_string(),
+            None,
+            None,
+        );
         rx.recv_blocking().expect("the cart runs");
         rx.recv_blocking().expect("and keeps running");
         let finished = session.wait();
         assert_eq!(finished.reason, "stopped");
 
-        let save_path = savefile::resolve_save_path(
+        let save_path = ggo_savefile::resolve_save_path(
             &card_dir,
             fixture::SAVING_CART_TITLE,
             fixture::SAVING_CART_SAVE_BYTES as usize,
@@ -1947,9 +1985,9 @@ mod tests {
         let file = std::fs::read(&save_path).unwrap();
         assert_eq!(
             file.len(),
-            savefile::SAVE_HDR_BYTES + fixture::SAVING_CART_SAVE_BYTES as usize
+            ggo_savefile::SAVE_HDR_BYTES + fixture::SAVING_CART_SAVE_BYTES as usize
         );
-        let payload = &file[savefile::SAVE_HDR_BYTES..];
+        let payload = &file[ggo_savefile::SAVE_HDR_BYTES..];
         let code_start = ggo_emu_core::cart::HEADER_LEN;
         assert_eq!(
             &payload[..fixture::SAVING_CART_WRITE_LEN],

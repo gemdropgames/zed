@@ -1466,8 +1466,15 @@ pub fn scan_ports_rescuing() -> (Vec<String>, bool) {
 
 /// Probe this machine. `project` is the open game project (the worktree
 /// root), `home` is where a clone would land under. Every filesystem and
-/// env read the flash flow makes happens here, once.
-pub fn probe(project: Option<&Path>, path_env: Option<&str>, home: &Path) -> HardwareEnv {
+/// env read the flash flow makes happens here, once. `emu_commit` is the
+/// running emulator module's build commit, read by the caller on the
+/// foreground because the runtime global is not reachable from here.
+pub fn probe(
+    project: Option<&Path>,
+    path_env: Option<&str>,
+    home: &Path,
+    emu_commit: Option<String>,
+) -> HardwareEnv {
     let diag = std::env::var(DIAG_BIN_ENV)
         .ok()
         .filter(|v| !v.trim().is_empty())
@@ -1502,7 +1509,6 @@ pub fn probe(project: Option<&Path>, path_env: Option<&str>, home: &Path) -> Har
         None => scan_ports_rescuing(),
     };
     let repo_commit = repo.as_deref().and_then(read_git_head);
-    let emu_commit = ggo_emu_core::BUILT_FROM_COMMIT.map(str::to_string);
     // Only asked when the banner will show: probe runs on the foreground
     // thread, and one short-lived `git cat-file` on the cached path is
     // the whole cost of a remedy that points the right way.

@@ -14,11 +14,11 @@ use std::time::{Duration, Instant};
 
 use gpui::{RenderImage, Task};
 
-use ggo_emu_core::peripherals::{SCREEN_HEIGHT, SCREEN_WIDTH};
-use ggo_emu_core::ppu::{
+use ggo_emu_abi::{
     BANK_BGFG, BANK_SPRITE, LAYER_COUNT, MAP_H, MAP_W, OAM_ENTRIES, OamEntry, PAL_ENTRIES,
     PALETTES, PpuSnapshot, TILE_PX, VRAM_TILE_CAP,
 };
+use ggo_emu_abi::{SCREEN_HEIGHT, SCREEN_WIDTH};
 
 /// The tile sheet: 1024 tiles as a 32×32 grid at 1×.
 pub const SHEET_TILES_PER_ROW: usize = 32;
@@ -307,7 +307,7 @@ pub fn oam_row_label(index: usize, entry: &OamEntry) -> String {
 
 /// A palette entry as `#RRGGBB (0xNNNN)`.
 pub fn rgb565_label(rgb565: u16) -> String {
-    let argb = ggo_emu_core::peripherals::rgb565_to_argb(rgb565);
+    let argb = ggo_emu_abi::rgb565_to_argb(rgb565);
     format!("#{:06X} (0x{rgb565:04X})", argb & 0x00FF_FFFF)
 }
 

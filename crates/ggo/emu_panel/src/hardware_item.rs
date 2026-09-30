@@ -415,7 +415,7 @@ impl Render for HardwareSetupItem {
         };
         let (requirements, ready, busy, status, log, progress, target, skew, can_sync, world) =
             panel.update(cx, |panel, cx| {
-                let env = panel.hardware_env_cached();
+                let env = panel.hardware_env_cached(cx);
                 let target = (
                     env.project
                         .as_ref()

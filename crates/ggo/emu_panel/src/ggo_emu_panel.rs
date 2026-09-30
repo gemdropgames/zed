@@ -228,6 +228,13 @@ impl Render for DraggedDivider {
 /// screen/debug row's.
 ///
 /// Pure so the clamps are testable without a window.
+/// The running emulator module's build commit, for the hardware skew check.
+fn emulator_build_commit(cx: &App) -> Option<String> {
+    ggo_emu_wasm::EmuRuntime::global(cx)
+        .and_then(|runtime| runtime.read(cx).current())
+        .and_then(|emulator| emulator.build_commit.clone())
+}
+
 fn divider_size(
     divider: Divider,
     position: gpui::Point<Pixels>,
@@ -921,9 +928,9 @@ impl EmuPanel {
     /// `probe` walks `/dev`, scans `PATH` four times and walks the
     /// ancestors for a repo -- fine once, ruinous from `render_transport`,
     /// which runs on every frame of a running cart.
-    fn hardware_env_cached(&mut self) -> hardware::HardwareEnv {
+    fn hardware_env_cached(&mut self, cx: &App) -> hardware::HardwareEnv {
         if self.hardware.is_none() {
-            self.hardware = Some(self.hardware_env());
+            self.hardware = Some(self.hardware_env(cx));
         }
         self.hardware.clone().unwrap_or_default()
     }
@@ -936,7 +943,7 @@ impl EmuPanel {
 
     /// This machine's hardware readiness, probed fresh (a setup run, or
     /// plugging the board in, changes the answer).
-    fn hardware_env(&self) -> hardware::HardwareEnv {
+    fn hardware_env(&self, cx: &App) -> hardware::HardwareEnv {
         if let Some(env) = &self.hardware_override {
             return env.clone();
         }
@@ -947,6 +954,7 @@ impl EmuPanel {
                 .or_else(|| std::env::var_os("USERPROFILE"))
                 .map(PathBuf::from)
                 .unwrap_or_default(),
+            emulator_build_commit(cx),
         )
     }
 
@@ -1061,7 +1069,7 @@ impl EmuPanel {
     pub(crate) fn confirm_setup_hardware(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_root(cx);
         self.invalidate_hardware();
-        let env = self.hardware_env_cached();
+        let env = self.hardware_env_cached(cx);
         let cascade = hardware::setup_cascade(&env);
         self.confirm_then(
             "Install the missing hardware tools?",
@@ -1079,7 +1087,7 @@ impl EmuPanel {
     pub(crate) fn confirm_sync_ggo_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_root(cx);
         self.invalidate_hardware();
-        let env = self.hardware_env_cached();
+        let env = self.hardware_env_cached(cx);
         let Some(cascade) = hardware::sync_cascade(&env) else {
             // Nothing to confirm, and not a silent no-op either:
             // `sync_ggo_repo` reports why it cannot.
@@ -1167,7 +1175,7 @@ impl EmuPanel {
         }
         self.refresh_root(cx);
         self.invalidate_hardware();
-        let env = self.hardware_env_cached();
+        let env = self.hardware_env_cached(cx);
         // Unconditional, because both outcomes are the same page: a
         // missing prerequisite is not a one-line error but a checklist
         // with buttons, and a started run is a timeline of phases. The
@@ -1253,7 +1261,7 @@ impl EmuPanel {
     pub fn setup_hardware(&mut self, cx: &mut Context<Self>) {
         self.refresh_root(cx);
         self.invalidate_hardware();
-        let env = self.hardware_env_cached();
+        let env = self.hardware_env_cached(cx);
         let steps = hardware::setup_steps(&env);
         if steps.is_empty() {
             let blocked: Vec<String> = env
@@ -1302,7 +1310,7 @@ impl EmuPanel {
     pub fn sync_ggo_repo(&mut self, cx: &mut Context<Self>) {
         self.refresh_root(cx);
         self.invalidate_hardware();
-        let env = self.hardware_env_cached();
+        let env = self.hardware_env_cached(cx);
         let Some(request) = env.sync_request() else {
             self.report_failure(
                 "only the GGO clone ZedGG manages can be synced from here".to_string(),
@@ -1893,7 +1901,20 @@ impl EmuPanel {
         // BEFORE the thread starts, so the pane never shows the last run's
         // "no output device" against this one. Mute is deliberately kept.
         self.audio.reset_for_run();
-        let (session, rx) = drive::start(root.join(&cart), cart, Some(self.audio.clone()), None);
+        let emulator = match drive::current_emulator(cx) {
+            Ok(emulator) => emulator,
+            Err(error) => {
+                self.report_failure(error.to_string(), cx);
+                return;
+            }
+        };
+        let (session, rx) = drive::start(
+            emulator,
+            root.join(&cart),
+            cart,
+            Some(self.audio.clone()),
+            None,
+        );
         session.set_speed(self.speed);
         self.console = Some(session.uart().clone());
         self.session = Some(session);
@@ -2643,8 +2664,8 @@ impl EmuPanel {
         cx: &mut Context<Self>,
     ) {
         self.debug.bank = bank & 1;
-        self.debug.palette = palette % ggo_emu_core::ppu::PALETTES;
-        self.debug.layer = layer % ggo_emu_core::ppu::LAYER_COUNT;
+        self.debug.palette = palette % ggo_emu_abi::PALETTES;
+        self.debug.layer = layer % ggo_emu_abi::LAYER_COUNT;
         self.debug.last_decoded_ptr = 0;
         cx.notify();
     }
@@ -2678,7 +2699,7 @@ impl EmuPanel {
     /// `None` for Palettes, which paints from the snapshot directly.
     fn decode_debug_tab(
         tab: debug::DebugTab,
-        snapshot: &ggo_emu_core::ppu::PpuSnapshot,
+        snapshot: &ggo_emu_abi::PpuSnapshot,
         bank: usize,
         palette: usize,
         layer: usize,
@@ -2696,8 +2717,8 @@ impl EmuPanel {
             ),
             debug::DebugTab::Oam => (
                 debug::oam_composite_bgra(snapshot),
-                ggo_emu_core::peripherals::SCREEN_WIDTH,
-                ggo_emu_core::peripherals::SCREEN_HEIGHT,
+                ggo_emu_abi::SCREEN_WIDTH,
+                ggo_emu_abi::SCREEN_HEIGHT,
             ),
             debug::DebugTab::Palettes => return None,
         };
@@ -2707,7 +2728,7 @@ impl EmuPanel {
 
     fn start_debug_decode(
         &mut self,
-        snapshot: Arc<ggo_emu_core::ppu::PpuSnapshot>,
+        snapshot: Arc<ggo_emu_abi::PpuSnapshot>,
         cx: &mut Context<Self>,
     ) {
         self.debug.generation += 1;
@@ -2740,7 +2761,7 @@ impl EmuPanel {
     /// Decode `snapshot` for the active tab synchronously -- the tests'
     /// way to exercise the viewers without a running cart.
     #[cfg(test)]
-    pub(crate) fn debug_decode_now(&mut self, snapshot: Arc<ggo_emu_core::ppu::PpuSnapshot>) {
+    pub(crate) fn debug_decode_now(&mut self, snapshot: Arc<ggo_emu_abi::PpuSnapshot>) {
         let tab = self.debug.tab;
         let image = Self::decode_debug_tab(
             tab,
@@ -3104,7 +3125,7 @@ impl EmuPanel {
     ) -> gpui::AnyElement {
         let bank_label = format!(
             "bank {}",
-            if self.debug.bank == ggo_emu_core::ppu::BANK_SPRITE {
+            if self.debug.bank == ggo_emu_abi::BANK_SPRITE {
                 "sprite"
             } else {
                 "bg/fg"
@@ -3128,7 +3149,7 @@ impl EmuPanel {
                 "ggo-emu-debug-palette",
                 palette_label,
                 |this, delta, cx| {
-                    let palettes = ggo_emu_core::ppu::PALETTES as isize;
+                    let palettes = ggo_emu_abi::PALETTES as isize;
                     let palette =
                         (this.debug.palette as isize + delta).rem_euclid(palettes) as usize;
                     let (bank, layer) = (this.debug.bank, this.debug.layer);
@@ -3146,7 +3167,7 @@ impl EmuPanel {
             debug::SHEET_PX,
             |_, _| {},
             |this, x, y, cx| {
-                let tile_px = ggo_emu_core::ppu::TILE_PX as f32;
+                let tile_px = ggo_emu_abi::TILE_PX as f32;
                 let span = debug::SHEET_PX as f32;
                 if x >= 0.0 && y >= 0.0 && x < span && y < span {
                     let index = (y / tile_px) as usize * debug::SHEET_TILES_PER_ROW
@@ -3172,7 +3193,7 @@ impl EmuPanel {
         let selectors = h_flex()
             .gap_1()
             .px_1()
-            .children((0..ggo_emu_core::ppu::LAYER_COUNT).map(|layer| {
+            .children((0..ggo_emu_abi::LAYER_COUNT).map(|layer| {
                 let enabled = decoded.snapshot.layer_enable[layer];
                 Button::new(
                     SharedString::from(format!("ggo-emu-debug-layer-{layer}")),
@@ -3192,7 +3213,7 @@ impl EmuPanel {
         let Some(image) = decoded.image.clone() else {
             return selectors.into_any_element();
         };
-        let layer = self.debug.layer % ggo_emu_core::ppu::LAYER_COUNT;
+        let layer = self.debug.layer % ggo_emu_abi::LAYER_COUNT;
         let (scroll_x, scroll_y) = decoded.snapshot.scroll[layer];
         let accent = cx.theme().colors().border_focused;
         let hover_snapshot = decoded.snapshot.clone();
@@ -3205,8 +3226,8 @@ impl EmuPanel {
                 // The 320x240 window the screen shows, at the layer's
                 // scroll, wrapping at the map edge like the hardware.
                 let (w, h) = (
-                    ggo_emu_core::peripherals::SCREEN_WIDTH as f32,
-                    ggo_emu_core::peripherals::SCREEN_HEIGHT as f32,
+                    ggo_emu_abi::SCREEN_WIDTH as f32,
+                    ggo_emu_abi::SCREEN_HEIGHT as f32,
                 );
                 let span = debug::MAP_PX as f32;
                 let sx = (scroll_x as f32) % span;
@@ -3228,7 +3249,7 @@ impl EmuPanel {
                 });
             },
             move |this, x, y, cx| {
-                let tile_px = ggo_emu_core::ppu::TILE_PX as f32;
+                let tile_px = ggo_emu_abi::TILE_PX as f32;
                 let span = debug::MAP_PX as f32;
                 if x >= 0.0 && y >= 0.0 && x < span && y < span {
                     let (cell_x, cell_y) = ((x / tile_px) as usize, (y / tile_px) as usize);
@@ -3262,19 +3283,16 @@ impl EmuPanel {
         let rows = debug::oam_rows(&decoded.snapshot);
         let enabled = rows.iter().filter(|(_, entry)| entry.enabled).count();
         let mut column = v_flex().gap_1().child(
-            Label::new(format!(
-                "{enabled} of {} enabled",
-                ggo_emu_core::ppu::OAM_ENTRIES
-            ))
-            .size(LabelSize::Small)
-            .color(Color::Muted),
+            Label::new(format!("{enabled} of {} enabled", ggo_emu_abi::OAM_ENTRIES))
+                .size(LabelSize::Small)
+                .color(Color::Muted),
         );
         if let Some(image) = decoded.image.clone() {
             column = column.child(self.debug_image_canvas(
                 "ggo-emu-debug-oam",
                 image,
-                ggo_emu_core::peripherals::SCREEN_WIDTH,
-                ggo_emu_core::peripherals::SCREEN_HEIGHT,
+                ggo_emu_abi::SCREEN_WIDTH,
+                ggo_emu_abi::SCREEN_HEIGHT,
                 |_, _| {},
                 |this, x, y, cx| {
                     this.set_debug_hover(format!("({}, {})", x as i32, y as i32), cx);
@@ -3304,8 +3322,8 @@ impl EmuPanel {
         let snapshot = decoded.snapshot.clone();
         let paint_snapshot = snapshot.clone();
         let swatch = DEBUG_SWATCH_PX;
-        let width = swatch * ggo_emu_core::ppu::PAL_ENTRIES as f32;
-        let height = swatch * 2.0 * ggo_emu_core::ppu::PALETTES as f32;
+        let width = swatch * ggo_emu_abi::PAL_ENTRIES as f32;
+        let height = swatch * 2.0 * ggo_emu_abi::PALETTES as f32;
         let bounds_cell: Rc<RefCell<Option<Bounds<Pixels>>>> = Rc::new(RefCell::new(None));
         let record = bounds_cell.clone();
         let grid = gpui::canvas(
@@ -3314,12 +3332,12 @@ impl EmuPanel {
             },
             move |bounds, _prepaint, window, _cx| {
                 for bank in 0..2 {
-                    for palette in 0..ggo_emu_core::ppu::PALETTES {
-                        for entry in 0..ggo_emu_core::ppu::PAL_ENTRIES {
+                    for palette in 0..ggo_emu_abi::PALETTES {
+                        for entry in 0..ggo_emu_abi::PAL_ENTRIES {
                             let rgb = paint_snapshot.palette_rgb565(bank, palette, entry);
-                            let argb = ggo_emu_core::peripherals::rgb565_to_argb(rgb);
+                            let argb = ggo_emu_abi::rgb565_to_argb(rgb);
                             let color = gpui::rgb(argb & 0x00FF_FFFF);
-                            let row = bank * ggo_emu_core::ppu::PALETTES + palette;
+                            let row = bank * ggo_emu_abi::PALETTES + palette;
                             let rect = Bounds::new(
                                 point(
                                     bounds.origin.x + px(entry as f32 * swatch),
@@ -3350,7 +3368,7 @@ impl EmuPanel {
                             this.set_debug_hover(
                                 format!(
                                     "{} pal {palette} slot {entry} = {}",
-                                    if bank == ggo_emu_core::ppu::BANK_SPRITE {
+                                    if bank == ggo_emu_abi::BANK_SPRITE {
                                         "sprite"
                                     } else {
                                         "bg/fg"
@@ -3506,7 +3524,7 @@ impl EmuPanel {
             .children(
                 // Offered whenever this machine cannot flash yet -- not
                 // only after a failed press.
-                (!self.is_flashing() && !self.hardware_env_cached().ready()).then(|| {
+                (!self.is_flashing() && !self.hardware_env_cached(cx).ready()).then(|| {
                     Button::new("ggo-emu-hardware-setup", "Set up hardware tooling")
                         .tooltip(Tooltip::text(
                             "What flashing needs, and install the missing parts",
@@ -4130,9 +4148,9 @@ impl EmuPanel {
 
     /// The board-readiness probe, re-run now: plugging the board in
     /// changes the answer, and the agent asks exactly when it wonders.
-    pub(crate) fn remote_env(&mut self) -> ggo_emu_remote::protocol::HwEnvPayload {
+    pub(crate) fn remote_env(&mut self, cx: &App) -> ggo_emu_remote::protocol::HwEnvPayload {
         self.invalidate_hardware();
-        self.hardware_env_cached().remote_payload()
+        self.hardware_env_cached(cx).remote_payload()
     }
 
     /// The button's cancel, for the agent. `false` when nothing was running.
@@ -4246,7 +4264,7 @@ impl EmuPanel {
         layer: usize,
     ) -> Result<serde_json::Value, String> {
         use crate::agent_remote::bgra_reply;
-        use ggo_emu_core::ppu::{LAYER_COUNT, PAL_ENTRIES};
+        use ggo_emu_abi::{LAYER_COUNT, PAL_ENTRIES};
         use ggo_emu_remote::protocol::DebugView;
         let snapshot = self
             .remote_session()?
@@ -4612,6 +4630,35 @@ mod tests {
         });
     }
 
+    /// With an `EmuRuntime` installed but no module loaded yet, Run reports
+    /// the runtime's reason in the status row -- the way it reports any
+    /// other failed start -- and starts nothing.
+    #[gpui::test]
+    async fn test_run_reports_an_emulator_that_is_not_available(cx: &mut TestAppContext) {
+        let (panel, cx) = windowed_panel(cx);
+        let fs = FakeFs::new(cx.executor());
+        cx.update(|_, cx| {
+            ggo_emu_wasm::EmuRuntime::init_with_config_path(
+                fs,
+                http_client::FakeHttpClient::with_404_response(),
+                "/home/.ggo/emulator.json".into(),
+                "/cache".into(),
+                cx,
+            );
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.project_root = Some(PathBuf::from("/proj"));
+            panel.selected = Some("green.cart".to_string());
+            panel.run(window, cx);
+            assert!(!panel.is_running(), "no emulator, no run");
+            assert_eq!(
+                panel.status.as_deref(),
+                Some("emulator module is still loading")
+            );
+            assert!(panel.status_is_error);
+        });
+    }
+
     /// A run that dies clears the session (so Stop stops being offered),
     /// surfaces its reason, and reports what happened to the ingest --
     /// here, a cart that never loaded, which has no frames to write.
@@ -4620,6 +4667,7 @@ mod tests {
         cx.executor().allow_parking();
         let (panel, cx) = windowed_panel(cx);
         let (session, rx) = drive::start(
+            drive::tests_support::test_emulator(),
             "/definitely/not/here.cart".into(),
             "gone.cart".into(),
             None,
@@ -4664,6 +4712,7 @@ mod tests {
         cx.executor().allow_parking();
         let (panel, cx) = windowed_panel(cx);
         let (session_a, rx_a) = drive::start(
+            drive::tests_support::test_emulator(),
             "/definitely/not/here.cart".into(),
             "run-a.cart".into(),
             None,
@@ -4686,6 +4735,7 @@ mod tests {
             panel.run_generation = 2;
             panel.session = Some(
                 drive::start(
+                    drive::tests_support::test_emulator(),
                     "/also/not/here.cart".into(),
                     "run-b.cart".into(),
                     None,
@@ -7331,8 +7381,15 @@ mod tests {
             let decoded = panel.debug.decoded.as_ref().unwrap();
             assert_eq!(decoded.tab, debug::DebugTab::Tiles);
             assert!(decoded.image.is_some());
-            // The green cart sets backdrop entry 0; palette 0 entry 0 is green.
-            assert_eq!(decoded.snapshot.palette_rgb565(0, 0, 0), 0x07E0);
+            // The green cart paints through the backdrop register, which is
+            // not part of the snapshot: palette 0 entry 0 stays black. What
+            // proves the snapshot came from the running module is that it
+            // arrived whole.
+            assert_eq!(decoded.snapshot.palette_rgb565(0, 0, 0), 0);
+            assert_eq!(
+                decoded.snapshot.tiles.len(),
+                ggo_emu_abi::VRAM_TILE_CAP * ggo_emu_abi::TILE_BYTES
+            );
         });
 
         cx.simulate_keystrokes("ctrl-alt-s");
@@ -9034,8 +9091,8 @@ mod tests {
     async fn test_remote_env_reports_the_probe(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (_db, _workspace, panel, _worktree_id, cx) = run_menu_workspace(cx, dir.path()).await;
-        panel.update(cx, |panel, _cx| {
-            let env = panel.remote_env();
+        panel.update(cx, |panel, cx| {
+            let env = panel.remote_env(cx);
             // Asserted against the payload's own internal consistency,
             // never against this host: the probe reads the real PATH,
             // HOME and /dev, so a developer machine with the board
