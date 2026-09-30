@@ -48,13 +48,26 @@ pub fn engine() -> Result<&'static Engine> {
                     std::thread::sleep(EPOCH_INTERVAL);
                 }
             })
-            .map(drop)
-            .unwrap_or_else(|error| log::error!("ggo-emu-epoch thread: {error}"));
+            .map_err(|error| format!("starting the epoch ticker: {error}"))?;
         Ok(engine)
     });
     engine
         .as_ref()
         .map_err(|error| anyhow!("wasmtime engine: {error}"))
+}
+
+/// `start..start + len` for a guest-supplied pointer and length, or `None`
+/// when the sum overflows.
+fn byte_range(start: usize, len: usize) -> Option<std::ops::Range<usize>> {
+    Some(start..start.checked_add(len)?)
+}
+
+/// The arena's bytes inside linear memory; `None` if the guest-reported
+/// bounds overflow or are inverted.
+fn arena_range(psram: usize, info: &CartInfo) -> Option<std::ops::Range<usize>> {
+    let start = psram.checked_add(info.arena_start)?;
+    let end = psram.checked_add(info.arena_end)?;
+    (start <= end).then_some(start..end)
 }
 
 struct HostState {
@@ -96,9 +109,8 @@ fn linker() -> Result<Linker<HostState>> {
                 return -1;
             };
             let start = path_ptr as usize;
-            let Some(path) = memory
-                .data(&caller)
-                .get(start..start + path_len as usize)
+            let Some(path) = byte_range(start, path_len as usize)
+                .and_then(|range| memory.data(&caller).get(range))
                 .map(|raw| String::from_utf8_lossy(raw).into_owned())
             else {
                 return -1;
@@ -179,7 +191,7 @@ impl LoadedEmulator {
             .call(&mut store, ())? as usize;
         let build_commit = memory
             .data(&store)
-            .get(commit_ptr..commit_ptr + commit_len)
+            .get(byte_range(commit_ptr, commit_len).context("build commit range overflows")?)
             .map(|raw| String::from_utf8_lossy(raw).into_owned())
             .filter(|commit| !commit.is_empty());
 
@@ -301,9 +313,11 @@ impl Guest {
         self.arm();
         let ptr = self.alloc.call(&mut self.store, bytes.len() as u32)?;
         let start = ptr as usize;
+        let range = byte_range(start, bytes.len())
+            .ok_or_else(|| anyhow!("emulator allocated an out-of-bounds buffer"))?;
         self.memory
             .data_mut(&mut self.store)
-            .get_mut(start..start + bytes.len())
+            .get_mut(range)
             .ok_or_else(|| anyhow!("emulator allocated an out-of-bounds buffer"))?
             .copy_from_slice(bytes);
         Ok(ptr)
@@ -316,16 +330,15 @@ impl Guest {
 
     fn read_bytes(&mut self, ptr: u32, len: usize) -> Result<Vec<u8>> {
         let start = ptr as usize;
-        self.memory
-            .data(&self.store)
-            .get(start..start + len)
+        byte_range(start, len)
+            .and_then(|range| self.memory.data(&self.store).get(range))
             .map(<[u8]>::to_vec)
             .ok_or_else(|| anyhow!("emulator returned an out-of-bounds buffer {start:#x}+{len}"))
     }
 
     fn read_samples(&mut self, ptr: u32, count: usize) -> Result<Vec<i16>> {
         Ok(self
-            .read_bytes(ptr, count * 2)?
+            .read_bytes(ptr, count.checked_mul(2).context("sample count overflows")?)?
             .chunks_exact(2)
             .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
             .collect())
@@ -547,7 +560,7 @@ impl WasmEmu {
             .funcs
             .psram_ptr
             .call(&mut self.guest.store, self.handle)? as usize;
-        let range = psram + self.info.arena_start..psram + self.info.arena_end;
+        let range = arena_range(psram, &self.info).context("arena range is invalid")?;
         let data = self.guest.memory.data_mut(&mut self.guest.store);
         let arena = data.get_mut(range).context("arena outside linear memory")?;
         Ok(f(arena))
@@ -847,6 +860,28 @@ mod tests {
             .expect("starts");
         run_until_vsyncs(&mut emu, 1);
         assert!(!emu.take_log().expect("log").is_empty());
+    }
+
+    #[test]
+    fn a_hostile_arena_range_is_an_error_not_a_panic() {
+        let info = |arena_start, arena_end| CartInfo {
+            arena_start,
+            arena_end,
+            ..CartInfo::default()
+        };
+        assert_eq!(arena_range(16, &info(4, 8)), Some(20..24));
+        assert_eq!(arena_range(16, &info(8, 4)), None);
+        assert_eq!(arena_range(usize::MAX, &info(0, 1)), None);
+        assert_eq!(arena_range(16, &info(0, usize::MAX)), None);
+        assert_eq!(byte_range(usize::MAX, 1), None);
+
+        let mut emu = loaded()
+            .start_cart(&fixture::green_screen_cart(), 1, None)
+            .expect("starts");
+        emu.info.arena_end = emu.info.arena_start.wrapping_sub(1);
+        assert!(emu.with_arena(|_| ()).is_err());
+        emu.info.arena_end = usize::MAX;
+        assert!(emu.with_arena(|_| ()).is_err());
     }
 
     #[test]

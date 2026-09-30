@@ -85,7 +85,7 @@ const A7: u32 = 17;
 const SYS_PRESENT: i32 = 0x00;
 const SYS_VSYNC_WAIT: i32 = 0x01;
 /// The backdrop is a PPU register (ppu-contract 11.2), not palette entry 0.
-const SYS_SET_BACKDROP: i32 = 0x4E;
+const SYS_SET_BACKDROP: i32 = ggo_emu_core::abi::Syscall::SetBackdrop as i32;
 const SYS_LOG: i32 = 0x4B;
 const SYS_SAVE_WRITE: i32 = 0x31;
 // Through `ggo_emu_core::abi`, which pins to `gemdrop_sdk::sys`
