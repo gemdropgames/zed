@@ -101,10 +101,14 @@ Save-file format (`ggo-emu-core/src/savefile.rs`) moves to its own
 native crate `ggo-savefile` (`tools/ggo-savefile`); `ggo-emu-core`
 re-exports it as `savefile`. zed depends on it.
 
-zed drops `ggo-emu-core` from every non-test build. It stays only as an
-optional dependency behind `ggo_emu_panel`'s `test-support` feature and
-as a dev-dependency, because the hand-assembled fixture carts and a few
-unit tests (link, APU pump) build native state.
+zed no longer links the emulator runtime in any build, but `ggo-emu-core`
+is still a transitive build dependency of non-test builds: `ggo-worldlib`
+uses its PPU cache constants and `ggo-audio` uses `VRAM_SAMPLE_BYTES` and
+the ADPCM `decode_block`. Follow-up: move those to a small shared crate
+(e.g. `ggo-emu-abi`) so the dependency can go. It is otherwise an
+optional dependency behind `ggo_emu_wasm`'s `test-support` feature and a
+dev-dependency, because the hand-assembled fixture carts and a few unit
+tests build native state.
 
 ### 2. zed side — sources and runtime
 
@@ -206,3 +210,17 @@ tags, configured URL; selecting writes `~/.ggo/emulator.json`.
 
 ggo branch (ABI additions) and zed branch `wasm-emulator` land together.
 Dropping the `ggo-emu-core` dependency from zed is the final task.
+
+## Deviations from this design
+
+- The module cache is keyed by version id (the URL, or
+  `{base_url}/{owner}/{repo}@{tag}` for Forgejo), not by content hash or
+  ETag. For Forgejo `latest`, the last resolved version id is kept in a
+  `<sha256(source config minus token)>.latest` file next to the cache so
+  an offline start can still find the cached release.
+- There is no `.cwasm` cache; the module is recompiled on every load.
+- Load and swap errors show as the panel's status line, not as a toast;
+  the previous module stays in use.
+- The golden-CRC integration test was replaced by behavioural fixture
+  tests (green cart presents green frames, overrun cart faults out of
+  memory, logging cart reaches `take_log`).
