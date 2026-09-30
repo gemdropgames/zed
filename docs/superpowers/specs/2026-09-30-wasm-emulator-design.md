@@ -68,16 +68,43 @@ New exports in `tools/ggo-emu/src/wasm.rs`:
 | `ggo_emu_arena_end(emu) -> u32` | EMWD tap scan bound (`mmu.plan.arena_end()`). |
 | `ggo_apu_*` (new/free/queue_samples/play_sample/run_frame/copy_since) | Audio panel preview. |
 
-Filesystem stays out of the module: no WASI, no host fs imports. The
-host reads the save file and card-dir asset files and passes the bytes
-into `ggo_emu_new` (extend its signature or add `ggo_emu_add_asset`
-before first frame); the host polls `save_dirty`, reads `save_ptr/len`,
-writes the file, and clears the flag. The module is a pure function of
-its inputs, which keeps network-fetched modules sandboxed.
+Filesystem stays out of the module: no WASI. Exactly one host import,
+`env.ggo_host_read_asset` (see "Asset reads"
+below), because `asset_load` resolves files against the cart directory at
+runtime (`ggo-emu-core/src/assets.rs:318`) and preloading a whole folder
+is not viable. The host resolves the path only inside the cart's own
+directory (reject absolute paths and any `..` component). The browser
+harness (`web/ggo-emu.js`) supplies a stub returning -1. Save files: the
+host writes loaded bytes into `save_ptr/len` after construction, polls
+`save_dirty`, reads the region, writes the file, clears the flag.
 
-PPU/screen constants and `rgb565_to_argb` used by zed debug UI move to
-a native no_std crate that changes rarely (`ggo-hal` or `ggo-wire`), so
-zed drops its `ggo-emu-core` dependency entirely.
+Asset reads: `env.ggo_host_read_asset(path_ptr, path_len, dst_ptr,
+dst_cap) -> i64`. Returns -1 when the file is missing or the path is
+rejected, otherwise the file's full length `n`; the bytes are copied to
+`dst_ptr` only when `n <= dst_cap`. The guest calls once with a 0 cap to
+learn `n`, allocates, and calls again. No host-side staging, no
+re-entrancy into guest exports.
+
+Guest RAM: exports `ggo_emu_psram_ptr(emu)` / `ggo_emu_psram_len(emu)`
+plus the arena bounds in `ggo_emu_info_json` let the host read and write
+guest RAM directly in linear memory (EMWD tap scan + arm). `read_ram`'s
+per-byte copy clamped to 2 MiB is too slow for a per-frame scan.
+
+Shared crate `ggo-emu-abi` (new, `tools/ggo-emu-abi`, no_std + alloc):
+ABI version constant, status codes, screen/PPU/APU constants,
+`rgb565_to_argb`, `PpuSnapshot`/`OamEntry`/`MapCell` plus a byte
+encoding (`PpuSnapshot::encode`/`decode`). `ggo-emu-core` re-exports
+these from their current module paths; zed depends on `ggo-emu-abi`.
+Any change to it bumps the ABI major.
+
+Save-file format (`ggo-emu-core/src/savefile.rs`) moves to its own
+native crate `ggo-savefile` (`tools/ggo-savefile`); `ggo-emu-core`
+re-exports it as `savefile`. zed depends on it.
+
+zed drops `ggo-emu-core` from every non-test build. It stays only as an
+optional dependency behind `ggo_emu_panel`'s `test-support` feature and
+as a dev-dependency, because the hand-assembled fixture carts and a few
+unit tests (link, APU pump) build native state.
 
 ### 2. zed side — sources and runtime
 
@@ -105,13 +132,16 @@ Implementations:
   non-draft, non-prerelease; downloads the asset named `asset_name`
   (`browser_download_url`).
 
-Setting `ggo.emulator.source` (default `"bundled"`):
+Config file `~/.ggo/emulator.json` (this fork has no Zed settings
+surface for GGO — `ggo_common.rs` documents env vars/`~/.ggo` as the
+convention). Missing file = `"bundled"`. Watched via `Fs::watch`;
+written by the picker.
 
 ```json
-"ggo": { "emulator": { "source": "bundled" } }
-"ggo": { "emulator": { "source": { "path": "../ggo/target/wasm32-unknown-unknown/release/ggo_emu.wasm" } } }
-"ggo": { "emulator": { "source": { "url": "https://…/ggo_emu.wasm" } } }
-"ggo": { "emulator": { "source": { "forgejo": { "base_url": "https://git.example", "owner": "gemdropgames", "repo": "ggo", "asset": "ggo_emu.wasm", "tag": "latest" } } } }
+{ "source": "bundled" }
+{ "source": { "path": "/home/clay/projects/ggo/tools/target/wasm32-unknown-unknown/release/ggo_emu.wasm" } }
+{ "source": { "url": "https://…/ggo_emu.wasm" } }
+{ "source": { "forgejo": { "base_url": "https://git.example", "owner": "gemdropgames", "repo": "ggo", "asset": "ggo_emu.wasm", "tag": "latest", "token": null } } }
 ```
 
 Cache: `paths::data_dir()/ggo-emu/<sha256>.wasm` plus
@@ -121,7 +151,7 @@ Cranelift and network sources work offline once cached.
 `EmuRuntime` (gpui `Global`):
 - Holds `Option<Arc<LoadedEmulator>>` (engine, module, ABI version,
   build commit, source label).
-- Observes the setting → resolve source → fetch → sha256 → cache →
+- Observes the config file → resolve source → fetch → sha256 → cache →
   compile/deserialize → validate ABI → publish → emit
   `EmulatorChanged`.
 - On failure: keep previous module, show error toast. If nothing is
@@ -133,7 +163,7 @@ borrow across the boundary.
 
 Picker: action `ggo: select emulator version`, built on the shared
 picker card (d145aca56a). Lists Bundled, Local (current path), Forgejo
-tags, configured URL; selecting writes the setting.
+tags, configured URL; selecting writes `~/.ggo/emulator.json`.
 
 ### 3. Integration
 
@@ -167,7 +197,8 @@ tags, configured URL; selecting writes the setting.
    accept/reject.
 3. Integration: boot a fixture cart through `WasmEmu`; framebuffer CRC
    and UART output match goldens recorded once from the native run over
-   N frames (goldens checked in, so no native dev-dep remains).
+   N frames. The existing `drive.rs` tests, rerouted through `WasmEmu`
+   with the fixture carts, are this test.
 4. Swap: `LocalSource` file rewrite → `EmulatorChanged` fires →
    session restarts.
 
