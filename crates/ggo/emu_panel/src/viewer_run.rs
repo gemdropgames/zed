@@ -18,9 +18,6 @@ use workspace::Workspace;
 use crate::drive::{self, Frame, Session};
 use crate::menu;
 
-/// The reason a run ends when the emulator module under it was swapped.
-const EMULATOR_CHANGED_STOP: &str = "emulator module changed";
-
 /// How many published frames may be waiting to be retired before the
 /// oldest is retired regardless. A consumer that is painting keeps at most
 /// the frame it last took, so anything beyond a handful means it has
@@ -361,7 +358,7 @@ impl ViewerRun {
         if self.session.is_none() {
             return;
         }
-        self.stop_with(EMULATOR_CHANGED_STOP.to_string(), cx);
+        self.stop_with(drive::EMULATOR_CHANGED_STOP.to_string(), cx);
         self.rebuild(cx);
     }
 

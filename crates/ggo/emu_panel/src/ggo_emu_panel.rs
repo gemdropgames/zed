@@ -228,11 +228,6 @@ impl Render for DraggedDivider {
 /// collapses. `panel` is the whole pane's bounds and `body` the
 /// screen/debug row's.
 ///
-/// Pure so the clamps are testable without a window.
-/// The running emulator module's build commit, for the hardware skew check.
-/// The reason a run ends when the emulator module under it was swapped.
-const EMULATOR_CHANGED_STOP: &str = "emulator module changed";
-
 /// What the header says about the emulator module, and whether it is an
 /// error: the label and short commit, or a failed load's message.
 fn emulator_version_label(runtime: &ggo_emu_wasm::EmuRuntime) -> Option<(String, bool)> {
@@ -258,12 +253,14 @@ fn emulator_version_label(runtime: &ggo_emu_wasm::EmuRuntime) -> Option<(String,
     }
 }
 
+/// The running emulator module's build commit, for the hardware skew check.
 fn emulator_build_commit(cx: &App) -> Option<String> {
     ggo_emu_wasm::EmuRuntime::global(cx)
         .and_then(|runtime| runtime.read(cx).current())
         .and_then(|emulator| emulator.build_commit.clone())
 }
 
+/// Pure so the clamps are testable without a window.
 fn divider_size(
     divider: Divider,
     position: gpui::Point<Pixels>,
@@ -987,6 +984,8 @@ impl EmuPanel {
         if self.session.is_none() {
             return;
         }
+        // Every tab constructs the pane with its window (`emu_item`); only
+        // windowless unit-test panes have none, and they never restart.
         let Some(window) = self.remote_window else {
             return;
         };
@@ -1008,7 +1007,7 @@ impl EmuPanel {
             return;
         }
         let remote_controlled = self.remote_controlled;
-        self.stop_with_reason(Some(EMULATOR_CHANGED_STOP), window, cx);
+        self.stop_with_reason(Some(drive::EMULATOR_CHANGED_STOP), window, cx);
         self.run(window, cx);
         // `run` hands the run back to the user; a restart is not a press.
         self.remote_controlled = remote_controlled && self.session.is_some();
@@ -2034,6 +2033,9 @@ impl EmuPanel {
     }
 
     fn on_frame(&mut self, frame: Frame, cx: &mut Context<Self>) {
+        if !self.status_is_error && self.status.as_deref() == Some(drive::EMULATOR_CHANGED_STOP) {
+            self.status = None;
+        }
         self.frame = frame.number;
         if self.stats.on_frame(
             frame.number,
@@ -2130,6 +2132,19 @@ impl EmuPanel {
                         // ended) since this one was taken -- this
                         // completion is stale, so don't let it stomp the
                         // live run's status.
+                        //
+                        // A module-swap restart is the exception: the old
+                        // run's record and end reason would otherwise go
+                        // unreported. Shown only until the new run has
+                        // produced a frame, and never over an ended run.
+                        if stop_reason.is_some() && this.session.is_some() {
+                            if this.frame == 0 && this.build_generation == owns_status {
+                                this.status = Some(reason);
+                                this.status_is_error = false;
+                            }
+                            this.ingest_status = status;
+                            cx.notify();
+                        }
                         return None;
                     }
                     if this.build_generation == owns_status {
@@ -4839,6 +4854,29 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while panel.read_with(cx, |panel, _| panel.ingest_status == IngestStatus::Idle) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the old run was never recorded"
+            );
+            if !cx.background_executor.tick() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                matches!(panel.ingest_status, IngestStatus::Done(..)),
+                "the old run was ingested: {:?}",
+                panel.ingest_status
+            );
+            assert!(
+                panel.status.as_deref() == Some("emulator module changed")
+                    || (panel.frame > 0 && panel.status.is_none()),
+                "the old run's reason shows until the new run's first frame: {:?}",
+                panel.status
+            );
+        });
         await_first_frame(&panel, cx);
         panel.read_with(cx, |panel, _| {
             assert!(panel.is_running(), "the restarted run is live");
@@ -4901,7 +4939,7 @@ mod tests {
         panel.update_in(cx, |panel, window, cx| panel.run(window, cx));
         await_first_frame(&panel, cx);
         panel.update_in(cx, |panel, window, cx| {
-            panel.stop_with_reason(Some(EMULATOR_CHANGED_STOP), window, cx)
+            panel.stop_with_reason(Some(drive::EMULATOR_CHANGED_STOP), window, cx)
         });
         cx.executor().run_until_parked();
         panel.read_with(cx, |panel, _| {

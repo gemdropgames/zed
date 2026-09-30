@@ -78,6 +78,9 @@ use crate::uart::UartLog;
 /// accounts of the one thing it asked for.
 pub const WORLD_PANEL_STOP: &str = "stopped by the world panel";
 
+/// The reason a run ends when the emulator module under it was swapped.
+pub const EMULATOR_CHANGED_STOP: &str = "emulator module changed";
+
 /// One 60 Hz vsync period -- `ggo_emu::FRAME_TIME`, redeclared because it
 /// lives in the `ggo-emu` binary crate (which drags in winit and cpal)
 /// rather than in `ggo-emu-core`.
