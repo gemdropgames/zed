@@ -55,6 +55,7 @@ ggo_daemon_client = { workspace = true, features = ["test-support"] }
 # matches on under ITS `test-support` -- same dance every GGO panel's
 # dev-deps document.
 remote_connection = { workspace = true, features = ["test-support"] }
+ggo_emu_wasm = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 path = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }

@@ -19,7 +19,7 @@
 //! the thread alive for [`DRAIN_FRAMES`] after the last push so the tail
 //! in the ring is heard before the writer's drop silences it.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -58,6 +58,7 @@ pub struct Preview {
     stop: Arc<AtomicBool>,
     progress: Arc<AtomicU32>,
     done: Arc<AtomicBool>,
+    error: Arc<Mutex<Option<String>>>,
 }
 
 impl Preview {
@@ -65,10 +66,12 @@ impl Preview {
         let stop = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(AtomicU32::new(0));
         let done = Arc::new(AtomicBool::new(false));
+        let error = Arc::new(Mutex::new(None));
         let spawned = std::thread::Builder::new()
             .name("ggo-audio-preview".into())
             .spawn({
-                let (stop, progress, done) = (stop.clone(), progress.clone(), done.clone());
+                let (stop, progress, done, error) =
+                    (stop.clone(), progress.clone(), done.clone(), error.clone());
                 move || {
                     let (mut writer, reader) = audio::channel(status.clone());
                     let mix_rate = match &spec {
@@ -79,18 +82,29 @@ impl Preview {
                     // device. `None` (no device) plays silently, which is
                     // the emulator pane's rule too.
                     let _out = audio::start_output(&status, reader, mix_rate);
-                    run(&spec, looping, &mut writer, &stop, &progress, true);
+                    if let Err(run_error) =
+                        run(&spec, looping, &mut writer, &stop, &progress, true)
+                    {
+                        log::error!("ggo audio preview: {run_error:#}");
+                        if let Ok(mut slot) = error.lock() {
+                            *slot = Some(format!("{run_error:#}"));
+                        }
+                    }
                     done.store(true, Ordering::Release);
                 }
             });
         if let Err(e) = spawned {
             log::error!("ggo-audio-preview thread: {e}");
+            if let Ok(mut slot) = error.lock() {
+                *slot = Some(format!("could not start the preview thread: {e}"));
+            }
             done.store(true, Ordering::Release);
         }
         Preview {
             stop,
             progress,
             done,
+            error,
         }
     }
 
@@ -101,6 +115,11 @@ impl Preview {
     /// 0.0 ..= 1.0 through the clip (wrapping when looping).
     pub fn progress(&self) -> f32 {
         self.progress.load(Ordering::Relaxed) as f32 / PROGRESS_SCALE as f32
+    }
+
+    /// Why the run ended early, if it did; meaningful once [`Self::is_done`].
+    pub fn take_error(&self) -> Option<String> {
+        self.error.lock().ok()?.take()
     }
 
     pub fn is_done(&self) -> bool {
@@ -140,9 +159,12 @@ pub(crate) fn run(
     stop: &AtomicBool,
     progress: &AtomicU32,
     pace: bool,
-) {
+) -> anyhow::Result<()> {
     match spec {
-        Spec::Source(decoded) => run_source(decoded, looping, sink, stop, progress, pace),
+        Spec::Source(decoded) => {
+            run_source(decoded, looping, sink, stop, progress, pace);
+            Ok(())
+        }
         Spec::Baked { blob, emulator } => {
             run_baked(blob, emulator, looping, sink, stop, progress, pace)
         }
@@ -222,22 +244,16 @@ fn run_baked(
     stop: &AtomicBool,
     progress: &AtomicU32,
     pace: bool,
-) {
+) -> anyhow::Result<()> {
     let Some((header, blocks)) = ggo_asset_formats::parse_adp(blob) else {
-        return;
+        return Ok(());
     };
     let len = header.block_count as usize * BLOCK_BYTES as usize;
     if len == 0 || header.rate_hz == 0 {
-        return;
+        return Ok(());
     }
-    let mut apu = match emulator.new_apu() {
-        Ok(apu) => apu,
-        Err(error) => {
-            log::error!("ggo audio preview: {error:#}");
-            return;
-        }
-    };
-    if let Err(error) = play_baked(
+    let mut apu = emulator.new_apu()?;
+    play_baked(
         &mut apu,
         &blocks[..len],
         header.rate_hz,
@@ -246,9 +262,7 @@ fn run_baked(
         stop,
         progress,
         pace,
-    ) {
-        log::error!("ggo audio preview: {error:#}");
-    }
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -313,15 +327,7 @@ mod tests {
     use super::*;
 
     fn test_emulator() -> Arc<LoadedEmulator> {
-        static EMULATOR: std::sync::OnceLock<Arc<LoadedEmulator>> = std::sync::OnceLock::new();
-        EMULATOR
-            .get_or_init(|| {
-                Arc::new(
-                    LoadedEmulator::compile(ggo_emu_wasm::BUNDLED_WASM, "bundled")
-                        .expect("the bundled emulator compiles"),
-                )
-            })
-            .clone()
+        ggo_emu_wasm::test_support::bundled_emulator()
     }
 
     fn tone(len: usize, rate: u32) -> Decoded {
@@ -386,7 +392,8 @@ mod tests {
             &stop,
             &progress,
             false,
-        );
+        )
+        .expect("the preview runs");
         // One second at the 32 kHz mix = ~64k interleaved samples, plus
         // the drain frames of silence.
         assert!(out.len() > 60_000, "{} samples", out.len());
@@ -419,7 +426,8 @@ mod tests {
             &stop,
             &progress,
             false,
-        );
+        )
+        .expect("the preview runs");
         assert_eq!(
             sink.pushes, 120,
             "the loop ran until Stop, not until the clip ended"
@@ -442,7 +450,8 @@ mod tests {
             &stop,
             &progress,
             false,
-        );
+        )
+        .expect("the preview runs");
         assert_eq!(out.len(), 1200, "every mono sample becomes an L/R pair");
         assert_eq!(&out[0..2], &[decoded.samples[0], decoded.samples[0]]);
         assert_eq!(progress.load(Ordering::Relaxed), PROGRESS_SCALE);
@@ -463,7 +472,8 @@ mod tests {
             &stop,
             &progress,
             false,
-        );
+        )
+        .expect("the preview runs");
         let empty = Arc::new(Decoded {
             samples: vec![],
             rate_hz: 16_000,
@@ -476,7 +486,8 @@ mod tests {
             &stop,
             &progress,
             false,
-        );
+        )
+        .expect("the preview runs");
         assert!(out.is_empty());
     }
 }

@@ -962,7 +962,10 @@ impl AudioPanel {
                     .update(cx, |this, cx| {
                         let done = this.preview.as_ref().is_none_or(|p| p.is_done());
                         if done {
-                            this.preview = None;
+                            let error = this.preview.take().and_then(|p| p.take_error());
+                            if let (Some(error), Some(open)) = (error, this.open_mut()) {
+                                open.error = Some(format!("preview failed: {error}"));
+                            }
                         }
                         cx.notify();
                         !done
