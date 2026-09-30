@@ -775,6 +775,7 @@ fn main() {
         markdown_preview::init(cx);
         csv_preview::init(cx);
         svg_preview::init(cx);
+        ggo_emu_wasm::EmuRuntime::init(app_state.fs.clone(), app_state.client.http_client(), cx); // GGO
         ggo_audio_panel::init(cx); // GGO
         ggo_charts_panel::init(cx); // GGO
         ggo_emerald_panel::init(cx); // GGO

@@ -116,6 +116,7 @@ ggo_audio_panel.workspace = true # GGO
 ggo_charts_panel.workspace = true # GGO
 ggo_emerald_panel.workspace = true # GGO
 ggo_emu_panel.workspace = true # GGO
+ggo_emu_wasm.workspace = true # GGO
 ggo_import_panel.workspace = true # GGO
 ggo_language.workspace = true # GGO
 ggo_reports_panel.workspace = true # GGO
