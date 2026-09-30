@@ -163,10 +163,15 @@ impl ForgejoSource {
         let found = if config.tag == "latest" {
             versions.iter().find(|version| !version.prerelease)
         } else {
-            let suffix = format!("@{}", config.tag);
+            let prefix = format!(
+                "{}/{}/{}@",
+                config.base_url.trim_end_matches('/'),
+                config.owner,
+                config.repo
+            );
             versions
                 .iter()
-                .find(|version| version.id.ends_with(&suffix))
+                .find(|version| version.id.strip_prefix(&prefix) == Some(config.tag.as_str()))
         };
         match found {
             Some(version) => Ok(version.clone()),
@@ -228,12 +233,22 @@ impl EmulatorSource for ForgejoSource {
 
     fn fetch(&self, version: &EmulatorVersion) -> BoxFuture<'static, Result<Arc<[u8]>>> {
         let http = self.http.clone();
+        let base_url = self.config.base_url.clone();
         let token = self.config.token.clone();
         let url = version.download_url.clone();
         Box::pin(async move {
             let url = url.context("release has no download URL")?;
+            let token = token.filter(|_| same_origin(&base_url, &url));
             Ok(Arc::from(get_bytes(http, url, token).await?))
         })
+    }
+}
+
+/// The token must not follow a release asset that is hosted elsewhere.
+fn same_origin(first: &str, second: &str) -> bool {
+    match (url::Url::parse(first), url::Url::parse(second)) {
+        (Ok(first), Ok(second)) => first.origin() == second.origin(),
+        _ => false,
     }
 }
 
@@ -255,13 +270,13 @@ async fn get_bytes(
         .send(request)
         .await
         .with_context(|| format!("GET {url}"))?;
-    let mut body = Vec::new();
-    response.body_mut().read_to_end(&mut body).await?;
     ensure!(
         response.status().is_success(),
         "GET {url}: HTTP {}",
         response.status()
     );
+    let mut body = Vec::new();
+    response.body_mut().read_to_end(&mut body).await?;
     Ok(body)
 }
 
@@ -285,22 +300,37 @@ mod tests {
         let http = FakeHttpClient::create(|request| async move {
             let uri = request.uri().to_string();
             let body = match uri.as_str() {
-                "https://git.example/api/v1/repos/gemdrop/ggo/releases?limit=50" => RELEASES.as_bytes().to_vec(),
+                "https://git.example/api/v1/repos/gemdrop/ggo/releases?limit=50" => {
+                    RELEASES.as_bytes().to_vec()
+                }
                 "https://git.example/dl/v020.wasm" => b"\0asmV020".to_vec(),
-                _ => return Ok(http_client::Response::builder().status(404).body(Default::default())?),
+                _ => {
+                    return Ok(http_client::Response::builder()
+                        .status(404)
+                        .body(Default::default())?);
+                }
             };
-            Ok(http_client::Response::builder().status(200).body(body.into())?)
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(body.into())?)
         });
         ForgejoSource {
-            config: ForgejoConfig { base_url: "https://git.example".into(), owner: "gemdrop".into(), repo: "ggo".into(),
-                asset: "ggo_emu.wasm".into(), tag: tag.into(), token: None },
+            config: ForgejoConfig {
+                base_url: "https://git.example".into(),
+                owner: "gemdrop".into(),
+                repo: "ggo".into(),
+                asset: "ggo_emu.wasm".into(),
+                tag: tag.into(),
+                token: None,
+            },
             http,
         }
     }
 
     #[test]
     fn forgejo_lists_non_draft_releases_that_carry_the_asset() {
-        let versions = futures::executor::block_on(forgejo("latest").list_versions()).expect("list");
+        let versions =
+            futures::executor::block_on(forgejo("latest").list_versions()).expect("list");
         let labels: Vec<_> = versions.iter().map(|v| v.label.as_str()).collect();
         assert_eq!(labels, ["v0.3.0-rc1 (pre-release)", "v0.2.0"]);
     }
@@ -325,14 +355,33 @@ mod tests {
     #[test]
     fn http_source_fetches_its_url_and_reports_http_errors() {
         let http = FakeHttpClient::create(|request| async move {
-            let status = if request.uri().path() == "/ok.wasm" { 200 } else { 500 };
-            Ok(http_client::Response::builder().status(status).body(b"\0asm".to_vec().into())?)
+            let status = if request.uri().path() == "/ok.wasm" {
+                200
+            } else {
+                500
+            };
+            Ok(http_client::Response::builder()
+                .status(status)
+                .body(b"\0asm".to_vec().into())?)
         });
-        let ok = HttpSource { url: "https://host/ok.wasm".into(), http: http.clone() };
-        let version = futures::executor::block_on(ok.list_versions()).expect("list").remove(0);
-        assert_eq!(&futures::executor::block_on(ok.fetch(&version)).expect("fetch")[..], b"\0asm");
-        let bad = HttpSource { url: "https://host/bad.wasm".into(), http };
-        let version = futures::executor::block_on(bad.list_versions()).expect("list").remove(0);
+        let ok = HttpSource {
+            url: "https://host/ok.wasm".into(),
+            http: http.clone(),
+        };
+        let version = futures::executor::block_on(ok.list_versions())
+            .expect("list")
+            .remove(0);
+        assert_eq!(
+            &futures::executor::block_on(ok.fetch(&version)).expect("fetch")[..],
+            b"\0asm"
+        );
+        let bad = HttpSource {
+            url: "https://host/bad.wasm".into(),
+            http,
+        };
+        let version = futures::executor::block_on(bad.list_versions())
+            .expect("list")
+            .remove(0);
         assert!(futures::executor::block_on(bad.fetch(&version)).is_err());
     }
 
@@ -340,9 +389,83 @@ mod tests {
     async fn local_source_reads_its_file(cx: &mut gpui::TestAppContext) {
         let fs = fs::FakeFs::new(cx.executor());
         fs.create_dir("/work".as_ref()).await.expect("mkdir");
-        fs.insert_file("/work/ggo_emu.wasm", b"\0asmLOCAL".to_vec()).await;
-        let source = LocalSource { path: "/work/ggo_emu.wasm".into(), fs };
+        fs.insert_file("/work/ggo_emu.wasm", b"\0asmLOCAL".to_vec())
+            .await;
+        let source = LocalSource {
+            path: "/work/ggo_emu.wasm".into(),
+            fs,
+        };
         let version = source.list_versions().await.expect("list").remove(0);
-        assert_eq!(&source.fetch(&version).await.expect("fetch")[..], b"\0asmLOCAL");
+        assert_eq!(
+            &source.fetch(&version).await.expect("fetch")[..],
+            b"\0asmLOCAL"
+        );
+    }
+
+    #[test]
+    fn a_pinned_tag_must_match_exactly() {
+        let source = forgejo("v1");
+        let version = |tag: &str| EmulatorVersion {
+            id: format!("https://git.example/gemdrop/ggo@{tag}"),
+            label: tag.into(),
+            download_url: None,
+            prerelease: false,
+        };
+        assert!(source.resolve(&[version("x@v1")]).is_err());
+        assert_eq!(
+            source
+                .resolve(&[version("x@v1"), version("v1")])
+                .expect("resolve")
+                .label,
+            "v1"
+        );
+    }
+
+    #[test]
+    fn the_token_is_only_sent_to_the_forgejo_host() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let http = FakeHttpClient::create({
+            let seen = seen.clone();
+            move |request| {
+                let seen = seen.clone();
+                async move {
+                    let authorized = request.headers().contains_key("Authorization");
+                    if let Ok(mut seen) = seen.lock() {
+                        seen.push((request.uri().to_string(), authorized));
+                    }
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(b"\0asm".to_vec().into())?)
+                }
+            }
+        });
+        let source = ForgejoSource {
+            config: ForgejoConfig {
+                base_url: "https://git.example".into(),
+                owner: "gemdrop".into(),
+                repo: "ggo".into(),
+                asset: default_asset(),
+                tag: default_tag(),
+                token: Some("secret".into()),
+            },
+            http,
+        };
+        let version = |url: &str| EmulatorVersion {
+            id: "id".into(),
+            label: "label".into(),
+            download_url: Some(url.into()),
+            prerelease: false,
+        };
+        futures::executor::block_on(source.fetch(&version("https://git.example/dl/a.wasm")))
+            .expect("same host");
+        futures::executor::block_on(source.fetch(&version("https://cdn.other/dl/b.wasm")))
+            .expect("other host");
+        assert_eq!(
+            *seen.lock().expect("lock"),
+            [
+                ("https://git.example/dl/a.wasm".to_string(), true),
+                ("https://cdn.other/dl/b.wasm".to_string(), false),
+            ]
+        );
     }
 }

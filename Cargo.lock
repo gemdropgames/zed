@@ -7596,6 +7596,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "url",
  "util",
  "wasmtime",
 ]
