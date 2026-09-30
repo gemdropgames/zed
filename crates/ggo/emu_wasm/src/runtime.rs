@@ -247,7 +247,9 @@ impl EmuRuntime {
         }));
     }
 
-    fn reload(&mut self, cx: &mut Context<Self>) {
+    /// Reloads the current config's module even though nothing changed,
+    /// e.g. to retry after a failed load.
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.status = RuntimeStatus::Loading;
         cx.notify();
 
@@ -472,6 +474,21 @@ mod tests {
                     .starts_with("Local")
             )
         });
+    }
+
+    #[gpui::test]
+    async fn reload_swaps_again_when_the_config_is_unchanged(cx: &mut TestAppContext) {
+        let (_fs, runtime) = setup(cx, None);
+        let changes = Rc::new(Cell::new(0));
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&runtime, {
+                let changes = changes.clone();
+                move |_, _: &EmulatorChanged, _| changes.set(changes.get() + 1)
+            })
+        });
+        runtime.update(cx, |runtime, cx| runtime.reload(cx));
+        settle(cx);
+        assert_eq!(changes.get(), 1);
     }
 
     #[gpui::test]

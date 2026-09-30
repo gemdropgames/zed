@@ -2,6 +2,7 @@
 //! runtime can switch to and rewrites `~/.ggo/emulator.json` through
 //! `EmuRuntime::select`. The runtime's config watcher does the hot swap.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
@@ -14,6 +15,7 @@ use gpui::{
     PathPromptOptions, Render, Task, WeakEntity, Window,
 };
 use picker::{Picker, PickerDelegate};
+use project::Fs;
 use ui::prelude::*;
 use ui::{ListItem, ListItemSpacing};
 use util::ResultExt as _;
@@ -210,9 +212,16 @@ impl EmulatorPicker {
     }
 
     fn select(&self, source: SourceConfig, cx: &mut Context<Self>) -> Task<Result<bool>> {
-        let selected = self.runtime.update(cx, |runtime, cx| {
-            runtime.select(EmulatorConfig { source }, cx)
-        });
+        let config = EmulatorConfig { source };
+        // The config watcher ignores a rewrite that changes nothing, so
+        // re-selecting the active source has to ask for the reload itself.
+        if self.runtime.read(cx).config() == &config {
+            self.runtime.update(cx, |runtime, cx| runtime.reload(cx));
+            return Task::ready(Ok(true));
+        }
+        let selected = self
+            .runtime
+            .update(cx, |runtime, cx| runtime.select(config, cx));
         cx.background_spawn(async move {
             selected.await?;
             Ok(true)
@@ -261,14 +270,7 @@ impl EmulatorPicker {
         let config = runtime.config().clone();
         let path = runtime.config_path().to_path_buf();
         let task = cx.spawn_in(window, async move |_, cx| {
-            if !fs.is_file(&path).await {
-                if let Some(parent) = path.parent() {
-                    fs.create_dir(parent).await?;
-                }
-                fs.write(&path, &serde_json::to_vec_pretty(&config)?)
-                    .await
-                    .with_context(|| format!("writing {}", path.display()))?;
-            }
+            create_config_if_absent(fs.as_ref(), &path, &config).await?;
             workspace
                 .update_in(cx, |workspace, window, cx| {
                     workspace.open_abs_path(path, OpenOptions::default(), window, cx)
@@ -278,6 +280,18 @@ impl EmulatorPicker {
         });
         self.finish_with(task, cx);
     }
+}
+
+async fn create_config_if_absent(fs: &dyn Fs, path: &Path, config: &EmulatorConfig) -> Result<()> {
+    if fs.is_file(path).await {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs.create_dir(parent).await?;
+    }
+    fs.write(path, &serde_json::to_vec_pretty(config)?)
+        .await
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 impl EventEmitter<DismissEvent> for EmulatorPicker {}
@@ -435,7 +449,7 @@ mod tests {
     use super::*;
     use crate::{SelectEmulatorVersion, init};
     use gpui::{Action as _, TestAppContext};
-    use project::{FakeFs, Fs as _, Project};
+    use project::{FakeFs, Project};
     use workspace::{AppState, MultiWorkspace};
 
     fn forgejo_config(tag: &str) -> SourceConfig {
@@ -469,6 +483,86 @@ mod tests {
         let rows = build_rows(&SourceConfig::Path("/work/ggo_emu.wasm".into()), &[]);
         assert_eq!(rows[2].label, "/work/ggo_emu.wasm");
         assert!(rows[2].current);
+    }
+
+    #[gpui::test]
+    async fn the_edit_row_creates_a_missing_config_and_keeps_an_existing_one(
+        cx: &mut TestAppContext,
+    ) {
+        let fs = FakeFs::new(cx.executor());
+        let path = Path::new("/home/.ggo/emulator.json");
+        let config = EmulatorConfig {
+            source: forgejo_config("latest"),
+        };
+        create_config_if_absent(fs.as_ref(), path, &config)
+            .await
+            .expect("create");
+        let written: EmulatorConfig =
+            serde_json::from_str(&fs.load(path).await.expect("load")).expect("valid");
+        assert_eq!(written, config);
+
+        fs.insert_file(path, br#"{"source":"bundled"}"#.to_vec())
+            .await;
+        create_config_if_absent(fs.as_ref(), path, &config)
+            .await
+            .expect("no-op");
+        assert_eq!(
+            fs.load(path).await.expect("load"),
+            r#"{"source":"bundled"}"#
+        );
+    }
+
+    #[gpui::test]
+    async fn test_reselecting_the_current_source_reloads_the_module(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+            editor::init(cx);
+            init(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.create_dir("/home/.ggo".as_ref()).await.expect("mkdir");
+        cx.update(|cx| {
+            EmuRuntime::init_with_config_path(
+                fs.clone(),
+                http_client::FakeHttpClient::with_404_response(),
+                "/home/.ggo/emulator.json".into(),
+                "/cache".into(),
+                cx,
+            );
+        });
+        let project = Project::test(fs.clone(), [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        cx.executor().run_until_parked();
+
+        let runtime = cx.update(|_, cx| EmuRuntime::global(cx)).expect("runtime");
+        let changes = std::rc::Rc::new(std::cell::Cell::new(0));
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&runtime, {
+                let changes = changes.clone();
+                move |_, _: &ggo_emu_wasm::EmulatorChanged, _| changes.set(changes.get() + 1)
+            })
+        });
+        workspace.update_in(cx, |_, window, cx| {
+            window.dispatch_action(SelectEmulatorVersion.boxed_clone(), cx);
+        });
+        cx.executor().run_until_parked();
+        let modal = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_modal::<EmulatorPicker>(cx)
+            })
+            .expect("picker");
+        let picker = modal.read_with(cx, |modal, _| modal.picker.clone());
+        picker.update_in(cx, |picker, window, cx| {
+            picker.delegate.set_selected_index(0, window, cx);
+            assert!(picker.delegate.row_at(0).is_some_and(|row| row.current));
+            picker.delegate.confirm(false, window, cx);
+        });
+        cx.executor().run_until_parked();
+        assert_eq!(changes.get(), 1, "the unchanged config still reloads");
     }
 
     #[gpui::test]
