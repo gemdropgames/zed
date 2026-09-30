@@ -230,6 +230,34 @@ impl Render for DraggedDivider {
 ///
 /// Pure so the clamps are testable without a window.
 /// The running emulator module's build commit, for the hardware skew check.
+/// The reason a run ends when the emulator module under it was swapped.
+const EMULATOR_CHANGED_STOP: &str = "emulator module changed";
+
+/// What the header says about the emulator module, and whether it is an
+/// error: the label and short commit, or a failed load's message.
+fn emulator_version_label(runtime: &ggo_emu_wasm::EmuRuntime) -> Option<(String, bool)> {
+    match runtime.status() {
+        ggo_emu_wasm::RuntimeStatus::Failed(message) => {
+            Some((format!("emulator: {message}"), true))
+        }
+        ggo_emu_wasm::RuntimeStatus::Loading if runtime.current().is_none() => {
+            Some(("emulator: loading".to_string(), false))
+        }
+        _ => {
+            let emulator = runtime.current()?;
+            let text = match emulator.build_commit.as_deref() {
+                Some(commit) => format!(
+                    "{} · {}",
+                    emulator.label,
+                    commit.chars().take(8).collect::<String>()
+                ),
+                None => emulator.label.to_string(),
+            };
+            Some((text, false))
+        }
+    }
+}
+
 fn emulator_build_commit(cx: &App) -> Option<String> {
     ggo_emu_wasm::EmuRuntime::global(cx)
         .and_then(|runtime| runtime.read(cx).current())
@@ -506,6 +534,7 @@ pub struct EmuPanel {
     /// and become the one the pane is showing; without this, run A's late
     /// completion would stomp run B's live status.
     run_generation: u64,
+    _subscriptions: Vec<Subscription>,
     /// How this panel spawns children -- `emd pack-ggo` for "Emulate this
     /// world", `ggo-diag` for "Run hardware diagnostics". Injectable for
     /// the same reason `ggo_emerald_panel`'s is: it is what lets those
@@ -860,6 +889,17 @@ impl EmuPanel {
         })
         .detach();
 
+        let mut _subscriptions = Vec::new();
+        if let Some(runtime) = ggo_emu_wasm::EmuRuntime::global(cx) {
+            _subscriptions.push(cx.subscribe(
+                &runtime,
+                |this, _, _: &ggo_emu_wasm::EmulatorChanged, cx| {
+                    this.restart_for_new_emulator(cx);
+                },
+            ));
+            _subscriptions.push(cx.observe(&runtime, |_, _, cx| cx.notify()));
+        }
+
         Self {
             focus_handle,
             workspace,
@@ -868,6 +908,7 @@ impl EmuPanel {
             selected: None,
             remote_controlled: false,
             run_generation: 0,
+            _subscriptions,
             proc_runner: job_stream::system_daemon_runner(),
             diag_env_override: None,
             build_generation: 0,
@@ -934,6 +975,43 @@ impl EmuPanel {
             self.hardware = Some(self.hardware_env(cx));
         }
         self.hardware.clone().unwrap_or_default()
+    }
+
+    /// The runtime swapped its module: the hardware skew check compares
+    /// against the module's build commit, and a live run is still on the
+    /// old one. Restarting needs a window, which the event does not carry,
+    /// so it goes through the pane's own.
+    fn restart_for_new_emulator(&mut self, cx: &mut Context<Self>) {
+        self.invalidate_hardware();
+        cx.notify();
+        if self.session.is_none() {
+            return;
+        }
+        let Some(window) = self.remote_window else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            window
+                .update(cx, |_, window, cx| {
+                    this.update(cx, |this, cx| this.restart_run(window, cx))
+                        .ok();
+                })
+                .log_err();
+        })
+        .detach();
+    }
+
+    /// Stop and start the same cart again through the ordinary paths; the
+    /// new session picks up the new module in [`Self::run`].
+    fn restart_run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session.is_none() {
+            return;
+        }
+        let remote_controlled = self.remote_controlled;
+        self.stop_with_reason(Some(EMULATOR_CHANGED_STOP), window, cx);
+        self.run(window, cx);
+        // `run` hands the run back to the user; a restart is not a press.
+        self.remote_controlled = remote_controlled && self.session.is_some();
     }
 
     /// Drop the cached probe: a setup run just changed the answer, and so
@@ -1987,6 +2065,16 @@ impl EmuPanel {
     /// duplicate `run` rows. `self.session.take()` IS the guard: the
     /// second caller for the same run finds `None` and returns.
     fn finish_run(&mut self, cx: &mut Context<Self>) {
+        self.finish_run_with_reason(None, cx);
+    }
+
+    /// `stop_reason` replaces the run's ordinary-end reason; a run that
+    /// failed keeps its own.
+    fn finish_run_with_reason(
+        &mut self,
+        stop_reason: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(session) = self.session.take() else {
             return;
         };
@@ -2027,7 +2115,11 @@ impl EmuPanel {
         let finish = cx.background_spawn(async move {
             let finished = session.wait();
             let status = ingest_finished_run(&finished, &connect, &label);
-            (finished.reason, finished.is_error, status)
+            let reason = match stop_reason {
+                Some(reason) if !finished.is_error => reason.to_string(),
+                _ => finished.reason,
+            };
+            (reason, finished.is_error, status)
         });
         cx.spawn(async move |this, cx| {
             let (reason, is_error, status) = finish.await;
@@ -2424,6 +2516,17 @@ impl EmuPanel {
     /// snapshot and console lines are collected off-thread by
     /// [`Self::finish_run`].
     pub(crate) fn stop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.stop_with_reason(None, window, cx);
+    }
+
+    /// [`Self::stop`], recording `reason` as how the run ended instead of
+    /// the thread's own "stopped".
+    fn stop_with_reason(
+        &mut self,
+        reason: Option<&'static str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.session.is_none() && self.latest_frame.is_none() {
             return;
         }
@@ -2436,7 +2539,7 @@ impl EmuPanel {
         // pump's own completion path calls `finish_run` directly, never
         // this, so nothing drops the task from inside itself.
         self._pump_task = None;
-        self.finish_run(cx);
+        self.finish_run_with_reason(reason, cx);
         self.release_atlas_all(window);
         cx.notify();
     }
@@ -3558,6 +3661,7 @@ impl EmuPanel {
                         Color::Muted
                     }),
             )
+            .children(self.render_emulator_version(cx))
             .child(div().flex_1())
             // The "is it actually running" readout: the cart's own frame
             // counter, straight off the last `EmuMsg::Frame`.
@@ -3567,6 +3671,18 @@ impl EmuPanel {
                     .color(Color::Muted)
             }))
             .into_any_element()
+    }
+
+    /// The emulator module the next run starts on, beside the cart name.
+    fn render_emulator_version(&self, cx: &App) -> Option<gpui::AnyElement> {
+        let runtime = ggo_emu_wasm::EmuRuntime::global(cx)?;
+        let (text, is_error) = emulator_version_label(runtime.read(cx))?;
+        Some(
+            Label::new(text)
+                .size(LabelSize::XSmall)
+                .color(if is_error { Color::Error } else { Color::Muted })
+                .into_any_element(),
+        )
     }
 
     /// Mute/unmute, sitting with Run and Stop because it is transport, not
@@ -4657,6 +4773,170 @@ mod tests {
                 Some("emulator module is still loading")
             );
             assert!(panel.status_is_error);
+        });
+    }
+
+    fn install_runtime(cx: &mut TestAppContext, fs: &Arc<FakeFs>) {
+        cx.foreground_executor()
+            .block_test(project::Fs::create_dir(fs.as_ref(), "/home/.ggo".as_ref()))
+            .unwrap();
+        cx.update(|cx| {
+            ggo_emu_wasm::EmuRuntime::init_with_config_path(
+                fs.clone(),
+                http_client::FakeHttpClient::with_404_response(),
+                "/home/.ggo/emulator.json".into(),
+                "/cache".into(),
+                cx,
+            );
+        });
+        cx.executor().advance_clock(std::time::Duration::from_millis(200));
+        cx.executor().run_until_parked();
+    }
+
+    /// Swap the runtime's module to a local copy of the bundled one; the
+    /// config watcher picks the rewrite up.
+    async fn swap_to_local_module(fs: &Arc<FakeFs>) {
+        project::Fs::create_dir(fs.as_ref(), "/work".as_ref()).await.unwrap();
+        fs.insert_file("/work/ggo_emu.wasm", ggo_emu_wasm::BUNDLED_WASM.to_vec())
+            .await;
+        fs.insert_file(
+            "/home/.ggo/emulator.json",
+            br#"{"source":{"path":"/work/ggo_emu.wasm"}}"#.to_vec(),
+        )
+        .await;
+    }
+
+    #[gpui::test]
+    async fn test_swapping_the_emulator_module_restarts_the_running_cart(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            AppState::test(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        install_runtime(cx, &fs);
+        let (panel, cx) = cx.add_window_view(EmuPanel::test_new);
+        let _db = select_green_cart(&panel, cx, dir.path());
+        panel.update_in(cx, |panel, window, cx| panel.run(window, cx));
+        await_first_frame(&panel, cx);
+        panel.update(cx, |panel, _| {
+            panel.hardware = Some(hardware::HardwareEnv {
+                diag_bin: Some("stale-probe".to_string()),
+                ..Default::default()
+            })
+        });
+        let first_generation = panel.read_with(cx, |panel, _| panel.run_generation);
+
+        swap_to_local_module(&fs).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while panel.read_with(cx, |panel, _| panel.run_generation) == first_generation {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no new run started after the swap"
+            );
+            cx.executor().advance_clock(std::time::Duration::from_millis(50));
+            if !cx.background_executor.tick() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        await_first_frame(&panel, cx);
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.is_running(), "the restarted run is live");
+            assert_eq!(
+                panel.session.as_ref().map(|session| session.cart.as_str()),
+                Some("green.cart"),
+                "the same cart"
+            );
+            assert!(
+                panel
+                    .hardware
+                    .as_ref()
+                    .is_none_or(|env| env.diag_bin.as_deref() != Some("stale-probe")),
+                "the skew probe is refreshed"
+            );
+        });
+        panel.update_in(cx, |panel, window, cx| panel.stop(window, cx));
+        cx.executor().run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_a_paused_run_restarts_unpaused_and_a_stopped_pane_stays_stopped(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            AppState::test(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        install_runtime(cx, &fs);
+        let (panel, cx) = cx.add_window_view(EmuPanel::test_new);
+        let _db = select_green_cart(&panel, cx, dir.path());
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.restart_run(window, cx);
+            assert!(!panel.is_running(), "nothing running, nothing restarted");
+            panel.run(window, cx);
+        });
+        await_first_frame(&panel, cx);
+        panel.update(cx, |panel, cx| {
+            panel.toggle_pause(cx);
+            assert!(panel.is_paused());
+        });
+        panel.update_in(cx, |panel, window, cx| panel.restart_run(window, cx));
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.is_running());
+            assert!(!panel.is_paused(), "a restart starts unpaused");
+        });
+        panel.update_in(cx, |panel, window, cx| panel.stop(window, cx));
+        cx.executor().run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_a_stop_with_a_reason_reports_it_instead_of_stopped(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let (panel, cx) = windowed_panel(cx);
+        let _db = select_green_cart(&panel, cx, dir.path());
+        panel.update_in(cx, |panel, window, cx| panel.run(window, cx));
+        await_first_frame(&panel, cx);
+        panel.update_in(cx, |panel, window, cx| {
+            panel.stop_with_reason(Some(EMULATOR_CHANGED_STOP), window, cx)
+        });
+        cx.executor().run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.status.as_deref(), Some("emulator module changed"));
+            assert!(!panel.status_is_error);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_the_header_names_the_active_emulator_module(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            AppState::test(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        install_runtime(cx, &fs);
+        let runtime = cx
+            .update(|cx| ggo_emu_wasm::EmuRuntime::global(cx))
+            .expect("installed");
+        runtime.read_with(cx, |runtime, _| {
+            let (text, is_error) = emulator_version_label(runtime).expect("loaded");
+            assert!(text.starts_with("Bundled"), "{text}");
+            assert!(!is_error);
+        });
+
+        fs.insert_file(
+            "/home/.ggo/emulator.json",
+            br#"{"source":{"path":"/nowhere.wasm"}}"#.to_vec(),
+        )
+        .await;
+        cx.executor().advance_clock(std::time::Duration::from_millis(200));
+        cx.executor().run_until_parked();
+        runtime.read_with(cx, |runtime, _| {
+            let (text, is_error) = emulator_version_label(runtime).expect("failed");
+            assert!(text.starts_with("emulator: "), "{text}");
+            assert!(is_error, "a failed load reads as an error");
         });
     }
 

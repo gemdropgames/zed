@@ -731,6 +731,32 @@ async fn boot_cart(
     Ok(panel)
 }
 
+/// The emulator module the panels run on, for `emu_status`. `null` when no
+/// runtime is installed; `label` and `abi` are `null` until a module has
+/// loaded.
+fn emulator_status_json(cx: &App) -> serde_json::Value {
+    let Some(runtime) = ggo_emu_wasm::EmuRuntime::global(cx) else {
+        return serde_json::Value::Null;
+    };
+    let runtime = runtime.read(cx);
+    let status = match runtime.status() {
+        ggo_emu_wasm::RuntimeStatus::Ready => "ready".to_string(),
+        ggo_emu_wasm::RuntimeStatus::Loading => "loading".to_string(),
+        ggo_emu_wasm::RuntimeStatus::Failed(message) => format!("failed: {message}"),
+    };
+    let current = runtime.current();
+    serde_json::json!({
+        "label": current.as_ref().map(|emulator| emulator.label.to_string()),
+        "commit": current.as_ref().and_then(|emulator| emulator.build_commit.clone()),
+        "abi": current.as_ref().map(|emulator| format!(
+            "{}.{}",
+            ggo_emu_abi::abi_major(emulator.abi_version),
+            ggo_emu_abi::abi_minor(emulator.abi_version),
+        )),
+        "status": status,
+    })
+}
+
 async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value, String> {
     // Snapshot panels and live workspaces on the foreground.
     struct Target {
@@ -803,7 +829,12 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
                 world: None,
             }));
         }
-        return Ok(serde_json::json!({ "pid": std::process::id(), "workspaces": rows }));
+        let emulator = cx.update(|cx| emulator_status_json(cx));
+        return Ok(serde_json::json!({
+            "pid": std::process::id(),
+            "workspaces": rows,
+            "emulator": emulator,
+        }));
     }
 
     let workspace_arg = match &cmd {
@@ -1306,6 +1337,51 @@ mod tests {
                 .insert(id, (weak, Some(handle)));
         });
         (workspace, cx)
+    }
+
+    #[gpui::test]
+    async fn emu_status_reports_the_active_emulator_module(cx: &mut TestAppContext) {
+        let mut async_cx = cx.to_async();
+        let status = dispatch_inner(Cmd::Status, &mut async_cx)
+            .await
+            .expect("status");
+        assert!(status["emulator"].is_null(), "no runtime installed");
+
+        let fs = FakeFs::new(cx.executor());
+        cx.foreground_executor()
+            .block_test(project::Fs::create_dir(fs.as_ref(), "/home/.ggo".as_ref()))
+            .unwrap();
+        cx.update(|cx| {
+            ggo_emu_wasm::EmuRuntime::init_with_config_path(
+                fs,
+                http_client::FakeHttpClient::with_404_response(),
+                "/home/.ggo/emulator.json".into(),
+                "/cache".into(),
+                cx,
+            );
+        });
+        let status = dispatch_inner(Cmd::Status, &mut async_cx)
+            .await
+            .expect("status");
+        assert_eq!(status["emulator"]["status"], "loading");
+
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
+        let status = dispatch_inner(Cmd::Status, &mut async_cx)
+            .await
+            .expect("status");
+        let emulator = &status["emulator"];
+        assert_eq!(emulator["status"], "ready");
+        assert_eq!(emulator["label"], "Bundled");
+        assert!(emulator["commit"].is_null() || emulator["commit"].is_string());
+        let abi = emulator["abi"].as_str().expect("abi string");
+        assert!(
+            abi.split_once('.')
+                .is_some_and(|(major, minor)| major.parse::<u32>().is_ok()
+                    && minor.parse::<u32>().is_ok()),
+            "{abi}"
+        );
     }
 
     /// `world_open` is the FIRST call an agent makes, with no world tab

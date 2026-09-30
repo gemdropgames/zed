@@ -18,6 +18,9 @@ use workspace::Workspace;
 use crate::drive::{self, Frame, Session};
 use crate::menu;
 
+/// The reason a run ends when the emulator module under it was swapped.
+const EMULATOR_CHANGED_STOP: &str = "emulator module changed";
+
 /// How many published frames may be waiting to be retired before the
 /// oldest is retired regardless. A consumer that is painting keeps at most
 /// the frame it last took, so anything beyond a handful means it has
@@ -297,6 +300,7 @@ pub struct ViewerRun {
     retiring: Vec<Arc<RenderImage>>,
     _watch: Option<Subscription>,
     _watch_debounce: Option<Task<()>>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl ViewerRun {
@@ -315,6 +319,13 @@ impl ViewerRun {
         })
         .detach();
         let _watch = project.map(|project| cx.subscribe(&project, Self::on_project_event));
+        let mut _subscriptions = Vec::new();
+        if let Some(runtime) = ggo_emu_wasm::EmuRuntime::global(cx) {
+            _subscriptions.push(cx.subscribe(
+                &runtime,
+                |this, _, _: &ggo_emu_wasm::EmulatorChanged, cx| this.restart_for_new_emulator(cx),
+            ));
+        }
         let mut this = Self {
             world_rel,
             project_root,
@@ -328,6 +339,7 @@ impl ViewerRun {
             retiring: Vec::new(),
             _watch,
             _watch_debounce: None,
+            _subscriptions,
         };
         this.rebuild(cx);
         this
@@ -339,6 +351,18 @@ impl ViewerRun {
 
     pub fn is_stopped(&self) -> bool {
         matches!(self.endpoint.state(), ViewerState::Stopped(_))
+    }
+
+    /// The emulator module was swapped. A live run is on the old module,
+    /// so end it and go through `rebuild`, which boots the replacement
+    /// (and picks up the new module in `boot`). A run that is still
+    /// building or already stopped has nothing to restart.
+    fn restart_for_new_emulator(&mut self, cx: &mut Context<Self>) {
+        if self.session.is_none() {
+            return;
+        }
+        self.stop_with(EMULATOR_CHANGED_STOP.to_string(), cx);
+        self.rebuild(cx);
     }
 
     /// Build the viewer cart and boot it, replacing any run in flight.
@@ -871,6 +895,86 @@ mod tests {
         );
         cx.run_until_parked();
         assert_eq!(builds(&calls), 2, "the viewer cart is built again");
+        assert_eq!(endpoint.state(), ggo_common::ViewerState::Running);
+    }
+
+    /// A swapped emulator module restarts the viewer cart on the new one,
+    /// through the same endpoint the world view is holding.
+    #[gpui::test]
+    async fn a_swapped_emulator_module_reboots_the_viewer_cart(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = project_dir();
+        let fs = project::FakeFs::new(cx.executor());
+        cx.foreground_executor()
+            .block_test(project::Fs::create_dir(fs.as_ref(), "/home/.ggo".as_ref()))
+            .unwrap();
+        cx.update(|cx| {
+            ggo_emu_wasm::EmuRuntime::init_with_config_path(
+                fs.clone(),
+                http_client::FakeHttpClient::with_404_response(),
+                "/home/.ggo/emulator.json".into(),
+                "/cache".into(),
+                cx,
+            );
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
+
+        let (runner, calls) = fake_emd(dir.path(), true);
+        let endpoint = ggo_common::LinkEndpoint::new();
+        let _run = cx.new(|cx| {
+            ViewerRun::new(
+                "assets/main.wrld.toml".into(),
+                dir.path().to_path_buf(),
+                runner,
+                endpoint.clone(),
+                None,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert_eq!(builds(&calls), 1);
+        assert_eq!(endpoint.state(), ggo_common::ViewerState::Running);
+
+        project::Fs::create_dir(fs.as_ref(), "/work".as_ref())
+            .await
+            .unwrap();
+        project::Fs::write(
+            fs.as_ref(),
+            "/work/ggo_emu.wasm".as_ref(),
+            ggo_emu_wasm::BUNDLED_WASM,
+        )
+        .await
+        .unwrap();
+        project::Fs::write(
+            fs.as_ref(),
+            "/home/.ggo/emulator.json".as_ref(),
+            br#"{"source":{"path":"/work/ggo_emu.wasm"}}"#,
+        )
+        .await
+        .unwrap();
+        for _ in 0..600 {
+            if builds(&calls) == 2 {
+                break;
+            }
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(50));
+            cx.run_until_parked();
+            cx.background_executor
+                .timer(std::time::Duration::from_millis(5))
+                .await;
+        }
+        assert_eq!(builds(&calls), 2, "the viewer cart is rebuilt and booted again");
+        for _ in 0..600 {
+            if endpoint.state() == ggo_common::ViewerState::Running {
+                break;
+            }
+            cx.run_until_parked();
+            cx.background_executor
+                .timer(std::time::Duration::from_millis(5))
+                .await;
+        }
         assert_eq!(endpoint.state(), ggo_common::ViewerState::Running);
     }
 

@@ -90,7 +90,7 @@ pub fn tool_list() -> Value {
           "description": "List running Zed sessions hosting a GGO emulator panel: pid, workspaces, and what each panel is doing.",
           "inputSchema": { "type": "object", "properties": {} } },
         { "name": "emu_status",
-          "description": "What the target session's emulator panels are doing: {pid, workspaces[{workspace, cart, running, paused, frame, run_kind, world}]}. run_kind is \"cart\" (a cart the user picked), \"world\" (a cartridge packed by \"Emulate this world\") or \"viewer\" (the live world view's viewer cart); `world` is the world's rel path for the latter two, null for a plain cart.",
+          "description": "What the target session's emulator panels are doing: {pid, workspaces[{workspace, cart, running, paused, frame, run_kind, world}], emulator{label, commit, abi, status}}. `emulator` is the active emulator module (commit is its build commit or null; abi is \"major.minor\"; status is \"ready\", \"loading\" or \"failed: <message>\"). run_kind is \"cart\" (a cart the user picked), \"world\" (a cartridge packed by \"Emulate this world\") or \"viewer\" (the live world view's viewer cart); `world` is the world's rel path for the latter two, null for a plain cart.",
           "inputSchema": with(json!({})) },
         { "name": "emu_start",
           "description": "Boot a cart in the Zed emulator panel and pause at the first frame boundary (LOCK-STEP by default) — the emulator tab comes to the front and its title says the run is MCP-controlled. Pack first with cart_pack (or emd pack-ggo --world <stem>). Returns the initial world-state JSON — worlds that declare `InspectWorld = {}` under [resources] serialize every entity's registered components; others return null. Drive with emu_next_frame; end with emu_stop. Pass freerun=true to boot the cart free-running instead (the panel's own Run button, no lock-step and no world inspection): then the game plays itself and you watch it with emu_screenshot/emu_uart and pause it with emu_pause.",
@@ -1625,6 +1625,20 @@ mod tests {
                 "sprite_tileset_image",
             ]
         );
+    }
+
+    #[test]
+    fn emu_status_description_documents_the_emulator_block() {
+        let list = tool_list();
+        let description = list["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "emu_status")
+            .unwrap()["description"]
+            .as_str()
+            .unwrap();
+        assert!(description.contains("emulator{label, commit, abi, status}"), "{description}");
     }
 
     /// The reference sheet is the whole point of the tool: an agent that
