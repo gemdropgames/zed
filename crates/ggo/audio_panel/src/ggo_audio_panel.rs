@@ -15,7 +15,7 @@
 //! keeps working at emerald's default rate for anyone who doesn't care.
 //!
 //! **Baked preview is the real thing.** `preview.rs` runs the blob through
-//! a standalone `ggo_emu_core::apu::Apu` -- 4-bit ADPCM, the 4.12 phase
+//! a standalone wasm-hosted APU -- 4-bit ADPCM, the 4.12 phase
 //! step, the 32 kHz mix -- into the emulator pane's cpal ring. Source is
 //! the decoded PCM as delivered. A/B between them is the whole point of
 //! the rate picker.
@@ -940,10 +940,18 @@ impl AudioPanel {
                 }
             },
         };
+        let emulator = match ggo_emu_panel::current_emulator(cx) {
+            Ok(emulator) => emulator,
+            Err(error) => {
+                open.error = Some(format!("no emulator module to preview with: {error:#}"));
+                cx.notify();
+                return;
+            }
+        };
         open.error = None;
         let looping = open.looping;
         self.status.reset_for_run();
-        self.preview = Some(Preview::start(spec, looping, self.status.clone()));
+        self.preview = Some(Preview::start(spec, looping, self.status.clone(), emulator));
         // Redraw the playhead until the thread reports done.
         self._playhead_task = Some(cx.spawn(async move |this, cx| {
             loop {

@@ -8,7 +8,7 @@
 //! - **Source**: the decoded PCM pushed in as-is, one 60 Hz frame's worth
 //!   per turn, played at the file's own rate.
 //! - **Baked**: the `.adp` blocks uploaded into a standalone
-//!   [`ggo_emu_core::apu::Apu`] and played on sample channel 0 exactly as
+//!   wasm-hosted APU ([`ggo_emu_wasm::WasmApu`]) and played on sample channel 0 exactly as
 //!   a cart would (`queue_samples` + `play_sample`), mixed a frame at a
 //!   time and tapped with `copy_since` -- the same loop `drive.rs` runs,
 //!   minus the CPU. What comes out is what the hardware will produce:
@@ -24,8 +24,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use ggo_audio::Decoded;
-use ggo_emu_core::apu::Apu;
+use ggo_emu_abi::{MIX_RATE, ONE_SHOT};
 use ggo_emu_panel::audio::{self, AudioStatus, RingWriter};
+use ggo_emu_wasm::{LoadedEmulator, WasmApu};
 
 /// What to play.
 pub enum Spec {
@@ -45,7 +46,7 @@ const DRAIN_FRAMES: u64 = 20;
 /// cart's pitch.
 const MIX_RATE_NOMINAL: u64 = 32_000;
 /// Contract §4: `loop_off == 0xFFFF_FFFF` plays once.
-const LOOP_NONE: u32 = ggo_emu_core::apu::ONE_SHOT;
+const LOOP_NONE: u32 = ONE_SHOT;
 pub(crate) const SAMPLES_PER_BLOCK: u64 = 120;
 pub(crate) const BLOCK_BYTES: u32 = 64;
 
@@ -57,7 +58,12 @@ pub struct Preview {
 }
 
 impl Preview {
-    pub fn start(spec: Spec, looping: bool, status: AudioStatus) -> Preview {
+    pub fn start(
+        spec: Spec,
+        looping: bool,
+        status: AudioStatus,
+        emulator: Arc<LoadedEmulator>,
+    ) -> Preview {
         let stop = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(AtomicU32::new(0));
         let done = Arc::new(AtomicBool::new(false));
@@ -69,13 +75,21 @@ impl Preview {
                     let (mut writer, reader) = audio::channel(status.clone());
                     let mix_rate = match &spec {
                         Spec::Source(decoded) => decoded.rate_hz,
-                        Spec::Baked(_) => ggo_emu_core::apu::MIX_RATE,
+                        Spec::Baked(_) => MIX_RATE,
                     };
                     // Held for the thread's life: dropping it closes the
                     // device. `None` (no device) plays silently, which is
                     // the emulator pane's rule too.
                     let _out = audio::start_output(&status, reader, mix_rate);
-                    run(&spec, looping, &mut writer, &stop, &progress, true);
+                    run(
+                        &spec,
+                        looping,
+                        &mut writer,
+                        &stop,
+                        &progress,
+                        true,
+                        &emulator,
+                    );
                     done.store(true, Ordering::Release);
                 }
             });
@@ -136,10 +150,11 @@ pub(crate) fn run(
     stop: &AtomicBool,
     progress: &AtomicU32,
     pace: bool,
+    emulator: &LoadedEmulator,
 ) {
     match spec {
         Spec::Source(decoded) => run_source(decoded, looping, sink, stop, progress, pace),
-        Spec::Baked(blob) => run_baked(blob, looping, sink, stop, progress, pace),
+        Spec::Baked(blob) => run_baked(blob, looping, sink, stop, progress, pace, emulator),
     }
 }
 
@@ -215,6 +230,7 @@ fn run_baked(
     stop: &AtomicBool,
     progress: &AtomicU32,
     pace: bool,
+    emulator: &LoadedEmulator,
 ) {
     let Some((header, blocks)) = ggo_asset_formats::parse_adp(blob) else {
         return;
@@ -223,23 +239,54 @@ fn run_baked(
     if len == 0 || header.rate_hz == 0 {
         return;
     }
-    let mut apu = Apu::new();
+    let mut apu = match emulator.new_apu() {
+        Ok(apu) => apu,
+        Err(error) => {
+            log::error!("ggo audio preview: {error:#}");
+            return;
+        }
+    };
+    if let Err(error) = play_baked(
+        &mut apu,
+        &blocks[..len],
+        header.rate_hz,
+        looping,
+        sink,
+        stop,
+        progress,
+        pace,
+    ) {
+        log::error!("ggo audio preview: {error:#}");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn play_baked(
+    apu: &mut WasmApu,
+    blocks: &[u8],
+    rate_hz: u32,
+    looping: bool,
+    sink: &mut dyn Sink,
+    stop: &AtomicBool,
+    progress: &AtomicU32,
+    pace: bool,
+) -> anyhow::Result<()> {
     // `queue_samples` clamps to the region and reports what landed; a clip
     // longer than 384 KiB previews as the truncated upload a cart would
     // get, which is the honest preview of it.
-    let uploaded = apu.queue_samples(0, &blocks[..len]);
+    let uploaded = apu.queue_samples(0, blocks)?;
     if uploaded <= 0 {
-        return;
+        return Ok(());
     }
-    let step = ((header.rate_hz as u64) << 12) / MIX_RATE_NOMINAL;
+    let step = ((rate_hz as u64) << 12) / MIX_RATE_NOMINAL;
     let step = step.min(0xFFFF) as u32;
     let step_vol = step | (0xFF << 16) | (0xFF << 24);
     let loop_off = if looping { 0 } else { LOOP_NONE };
-    if apu.play_sample(0, 0, uploaded as u32, loop_off, step_vol, 0) < 0 {
-        return;
+    if apu.play_sample(0, 0, uploaded as u32, loop_off, step_vol, 0)? < 0 {
+        return Ok(());
     }
     let total_samples = uploaded as u64 / u64::from(BLOCK_BYTES) * SAMPLES_PER_BLOCK;
-    let frames_total = (total_samples * 60).div_ceil(header.rate_hz as u64).max(1);
+    let frames_total = (total_samples * 60).div_ceil(rate_hz as u64).max(1);
     let mut pacer = Pacer {
         last: Instant::now(),
         on: pace,
@@ -248,9 +295,9 @@ fn run_baked(
     let mut scratch = Vec::new();
     let mut frames = 0u64;
     while !stop.load(Ordering::Acquire) {
-        apu.run_frame();
+        apu.run_frame()?;
         scratch.clear();
-        cursor = apu.copy_since(cursor, &mut scratch);
+        cursor = apu.copy_since(cursor, &mut scratch)?;
         sink.push(&scratch);
         frames += 1;
         let played = if looping {
@@ -267,11 +314,24 @@ fn run_baked(
         }
         pacer.hold();
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_emulator() -> Arc<LoadedEmulator> {
+        static EMULATOR: std::sync::OnceLock<Arc<LoadedEmulator>> = std::sync::OnceLock::new();
+        EMULATOR
+            .get_or_init(|| {
+                Arc::new(
+                    LoadedEmulator::compile(ggo_emu_wasm::BUNDLED_WASM, "bundled")
+                        .expect("the bundled emulator compiles"),
+                )
+            })
+            .clone()
+    }
 
     fn tone(len: usize, rate: u32) -> Decoded {
         // 8000-amplitude integer triangle at rate/40 Hz.
@@ -325,7 +385,15 @@ mod tests {
         let mut out = Vec::new();
         let stop = AtomicBool::new(false);
         let progress = AtomicU32::new(0);
-        run(&Spec::Baked(blob), false, &mut out, &stop, &progress, false);
+        run(
+            &Spec::Baked(blob),
+            false,
+            &mut out,
+            &stop,
+            &progress,
+            false,
+            &test_emulator(),
+        );
         // One second at the 32 kHz mix = ~64k interleaved samples, plus
         // the drain frames of silence.
         assert!(out.len() > 60_000, "{} samples", out.len());
@@ -348,7 +416,15 @@ mod tests {
             stop: stop.clone(),
         };
         let progress = AtomicU32::new(0);
-        run(&Spec::Baked(blob), true, &mut sink, &stop, &progress, false);
+        run(
+            &Spec::Baked(blob),
+            true,
+            &mut sink,
+            &stop,
+            &progress,
+            false,
+            &test_emulator(),
+        );
         assert_eq!(
             sink.pushes, 120,
             "the loop ran until Stop, not until the clip ended"
@@ -371,6 +447,7 @@ mod tests {
             &stop,
             &progress,
             false,
+            &test_emulator(),
         );
         assert_eq!(out.len(), 1200, "every mono sample becomes an L/R pair");
         assert_eq!(&out[0..2], &[decoded.samples[0], decoded.samples[0]]);
@@ -389,6 +466,7 @@ mod tests {
             &stop,
             &progress,
             false,
+            &test_emulator(),
         );
         let empty = Arc::new(Decoded {
             samples: vec![],
@@ -402,6 +480,7 @@ mod tests {
             &stop,
             &progress,
             false,
+            &test_emulator(),
         );
         assert!(out.is_empty());
     }

@@ -28,7 +28,8 @@ ggo-asset-formats.workspace = true # GGO -- `parse_adp` for the Baked preview's 
 # deliberately does not send. Bake/size/write went to the daemon in P3;
 # this goes in P4 with the preview. See `docs/daemon-api-plan.md` §4.4.
 ggo-audio.workspace = true
-ggo-emu-core.workspace = true # GGO -- the standalone `Apu` behind the Baked preview
+ggo-emu-abi.workspace = true # GGO -- mix rate / one-shot constants
+ggo_emu_wasm.workspace = true # GGO -- the wasm-hosted `Apu` behind the Baked preview
 ggo_common.workspace = true
 ggo_daemon_client.workspace = true # GGO -- probe / bake / size / write
 ggo_emu_panel.workspace = true # GGO -- the cpal ring the emulator pane already owns

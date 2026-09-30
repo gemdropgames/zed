@@ -114,6 +114,7 @@ use input::InputState;
 use stats::RunStats;
 use uart::UartLog;
 
+pub use drive::current_emulator;
 pub use emu_item::EmulatorItem;
 
 actions!(
