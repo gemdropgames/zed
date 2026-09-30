@@ -18,9 +18,10 @@
 //! out -- cart exit, CPU fault, or the panel's stop flag -- the thread
 //! asks the module for the whole run's perf JSON (`perf_json`, the same
 //! document `CartStepper::perf_json` produces) and stores it in a
-//! [`PerfSnapshot`] in the shared [`Session`] slot, then returns. [`Session::wait`] joins the thread and hands the panel the
-//! snapshot plus the run's diagnostic lines, which is what
-//! [`crate::ingest`] writes to the database.
+//! [`PerfSnapshot`] in the shared [`Session`] slot, then returns.
+//! [`Session::wait`] joins the thread and hands the panel the snapshot
+//! plus the run's diagnostic lines, which is what [`crate::ingest`] writes
+//! to the database.
 //!
 //! This is deliberately NOT ggo-ide's `EmuCmd::Snapshot` request/reply
 //! round trip. That shape exists because its emu thread is persistent and
@@ -81,9 +82,8 @@ pub const WORLD_PANEL_STOP: &str = "stopped by the world panel";
 /// The reason a run ends when the emulator module under it was swapped.
 pub const EMULATOR_CHANGED_STOP: &str = "emulator module changed";
 
-/// One 60 Hz vsync period -- `ggo_emu::FRAME_TIME`, redeclared because it
-/// lives in the `ggo-emu` binary crate (which drags in winit and cpal)
-/// rather than in `ggo-emu-core`.
+/// One 60 Hz vsync period -- the pacing target, matching the standalone
+/// `ggo-emu` binary's `FRAME_TIME`.
 pub const FRAME_TIME: Duration = Duration::from_micros(16_667);
 
 /// The fastest the pane will drive a cart: ten frames per real frame
@@ -1059,18 +1059,8 @@ pub use ggo_emu_wasm::fixture;
 pub mod tests_support {
     use super::*;
 
-    /// The bundled emulator module, compiled once per test process --
-    /// compiling is the slow part and every run shares the result.
     pub fn test_emulator() -> Arc<LoadedEmulator> {
-        static EMULATOR: std::sync::OnceLock<Arc<LoadedEmulator>> = std::sync::OnceLock::new();
-        EMULATOR
-            .get_or_init(|| {
-                Arc::new(
-                    LoadedEmulator::compile(ggo_emu_wasm::BUNDLED_WASM, "bundled")
-                        .expect("the bundled emulator compiles"),
-                )
-            })
-            .clone()
+        ggo_emu_wasm::test_support::bundled_emulator()
     }
 
     /// Run the green fixture cart until `frames` frames have arrived,

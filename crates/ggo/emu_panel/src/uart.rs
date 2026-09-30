@@ -10,20 +10,12 @@
 //!
 //! # What actually reaches this log in cart mode
 //!
-//! `ggo-emu-core` gives a `.cart` XIP run no *hardware* UART -- only the
-//! full-system boot path has one (`FullSystemBus::take_uart`), and that
-//! path is not what this pane drives. But the `log(ptr, len)` syscall
-//! (`ggo-emu-core/src/runtime.rs`'s `Some(Syscall::Log)` arm) has its own
-//! channel: `Peripherals::log_sink`, an `Option<Vec<u8>>` a driver attaches
-//! at construction and drains with `Peripherals::take_log`. [`crate::drive`]
-//! attaches one and drains it every turn, so a cart's own `log()` calls
-//! land here alongside the driver's per-run markers (`[run]`,
-//! `[run ended]`, `[cart load failed]`) -- exactly what `ggo-ide`'s cart
-//! runner does with the same sink (`tools/ggo-ide/src/emu/mod.rs`,
-//! `CartStepper::new` attaches it, `CartStepper::drain_uart` forwards it).
-//! Without a sink attached, the syscall falls back to a bare
-//! `println!("cart-log: {..}")` to the host process's stdout, which is
-//! what every standalone CLI binary (`ggo-emu`) still gets.
+//! A `.cart` XIP run has no *hardware* UART. The `log(ptr, len)` syscall
+//! has its own channel: the emulator module is started with
+//! `NEW_FLAG_LOG_SINK`, and [`crate::drive`] drains it every turn with
+//! `WasmEmu::take_log`, so a cart's own `log()` calls land here alongside
+//! the driver's per-run markers (`[run]`, `[run ended]`,
+//! `[cart load failed]`).
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};

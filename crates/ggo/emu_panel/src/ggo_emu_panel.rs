@@ -1,10 +1,10 @@
 //! GGO Emulator panel (F3 tasks E1/E2, F4 X4): an embedded `ggo-emu` --
 //! Run/Stop, live 320x240 video, keyboard -> pad input, a live stats row,
 //! a diagnostic console, and an end-of-run perf ingest into the
-//! GemdropGo database. The emulation itself is `ggo-emu-core` verbatim;
-//! [`drive`] ports the standalone binary's drive loop
-//! (`ggo-emu/src/lib.rs::run_cart` + `src/native.rs`) onto a background
-//! thread, and this module is the gpui shell around it.
+//! GemdropGo database. The emulation itself runs in the swappable wasm
+//! emulator module (`ggo_emu_wasm`); [`drive`] ports the standalone
+//! binary's drive loop (`ggo-emu/src/lib.rs::run_cart` + `src/native.rs`)
+//! onto a background thread, and this module is the gpui shell around it.
 //!
 //! # How a cart gets here
 //!
@@ -226,11 +226,6 @@ impl Render for DraggedDivider {
     }
 }
 
-/// Resolve a divider drag at window position `position` into the new
-/// size of the region that divider controls, clamped so neither side
-/// collapses. `panel` is the whole pane's bounds and `body` the
-/// screen/debug row's.
-///
 /// What the header says about the emulator module, and whether it is an
 /// error: the label and short commit, or a failed load's message.
 fn emulator_version_label(runtime: &ggo_emu_wasm::EmuRuntime) -> Option<(String, bool)> {
@@ -263,6 +258,11 @@ fn emulator_build_commit(cx: &App) -> Option<String> {
         .and_then(|emulator| emulator.build_commit.clone())
 }
 
+/// Resolve a divider drag at window position `position` into the new
+/// size of the region that divider controls, clamped so neither side
+/// collapses. `panel` is the whole pane's bounds and `body` the
+/// screen/debug row's.
+///
 /// Pure so the clamps are testable without a window.
 fn divider_size(
     divider: Divider,
