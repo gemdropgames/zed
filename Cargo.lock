@@ -7605,6 +7605,7 @@ dependencies = [
  "tempfile",
  "url",
  "util",
+ "wasm-encoder 0.252.0",
  "wasmtime",
 ]
 

@@ -37,3 +37,4 @@ gpui = { workspace = true, features = ["test-support"] }
 http_client = { workspace = true, features = ["test-support"] }
 ggo-emu-core.workspace = true
 tempfile.workspace = true
+wasm-encoder.workspace = true

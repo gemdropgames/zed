@@ -5,6 +5,7 @@
 //! reads are confined to the cart's own directory, and every call runs under
 //! an epoch deadline so a wedged module traps instead of freezing the caller.
 
+use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -16,7 +17,10 @@ use ggo_emu_abi::{
 };
 use gpui::SharedString;
 use util::ResultExt as _;
-use wasmtime::{Caller, Engine, Instance, Linker, Memory, Module, Store, TypedFunc};
+use wasmtime::{
+    Caller, Engine, Instance, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder,
+    TypedFunc,
+};
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod fixture;
@@ -24,6 +28,27 @@ pub mod runtime;
 pub mod sources;
 
 pub use runtime::*;
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
+    use std::sync::{Arc, OnceLock};
+
+    use crate::{BUNDLED_WASM, LoadedEmulator};
+
+    /// The bundled module, compiled once per test process -- compiling is
+    /// the slow part and every test shares the result.
+    pub fn bundled_emulator() -> Arc<LoadedEmulator> {
+        static EMULATOR: OnceLock<Arc<LoadedEmulator>> = OnceLock::new();
+        EMULATOR
+            .get_or_init(|| {
+                Arc::new(
+                    LoadedEmulator::compile(BUNDLED_WASM, "bundled")
+                        .expect("the bundled emulator compiles"),
+                )
+            })
+            .clone()
+    }
+}
 
 pub const REQUIRED_ABI_MAJOR: u16 = 1;
 pub const MIN_ABI_MINOR: u16 = 0;
@@ -74,8 +99,31 @@ fn arena_range(psram: usize, info: &CartInfo) -> Option<std::ops::Range<usize>> 
     (start <= end).then_some(start..end)
 }
 
+/// Generous against the real need (an 8 MiB PSRAM die plus staging), tight
+/// enough that a hostile module cannot take the machine's memory.
+const MAX_GUEST_MEMORY_BYTES: usize = 1 << 30;
+const MAX_GUEST_TABLE_ELEMENTS: usize = 100_000;
+/// Well above the emulator's own 2 MiB asset read limit.
+const MAX_CARD_FILE_BYTES: u64 = 16 << 20;
+
 struct HostState {
     card_dir: Option<PathBuf>,
+    limits: StoreLimits,
+}
+
+impl HostState {
+    fn new(card_dir: Option<PathBuf>) -> HostState {
+        HostState {
+            card_dir,
+            limits: StoreLimitsBuilder::new()
+                .memory_size(MAX_GUEST_MEMORY_BYTES)
+                .table_elements(MAX_GUEST_TABLE_ELEMENTS)
+                .instances(1)
+                .memories(1)
+                .tables(1)
+                .build(),
+        }
+    }
 }
 
 /// The guest's asset lookups resolve only inside the cart's own directory,
@@ -89,7 +137,12 @@ fn read_card_file(card_dir: &Path, path: &str) -> Option<Vec<u8>> {
     {
         return None;
     }
-    std::fs::read(card_dir.join(relative)).ok()
+    let file = std::fs::File::open(card_dir.join(relative)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_CARD_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= MAX_CARD_FILE_BYTES).then_some(bytes)
 }
 
 fn linker() -> Result<Linker<HostState>> {
@@ -139,7 +192,8 @@ fn instantiate(
     module: &Module,
     card_dir: Option<PathBuf>,
 ) -> Result<(Store<HostState>, Instance, Memory)> {
-    let mut store = Store::new(engine()?, HostState { card_dir });
+    let mut store = Store::new(engine()?, HostState::new(card_dir));
+    store.limiter(|state| &mut state.limits);
     store.set_epoch_deadline(TURN_DEADLINE_TICKS);
     let instance = linker()?
         .instantiate(&mut store, module)
@@ -167,11 +221,7 @@ impl LoadedEmulator {
     pub fn compile(bytes: &[u8], label: impl Into<SharedString>) -> Result<LoadedEmulator> {
         let module = Module::new(engine()?, bytes).context("compiling the emulator module")?;
 
-        let mut store = Store::new(engine()?, HostState { card_dir: None });
-        store.set_epoch_deadline(TURN_DEADLINE_TICKS);
-        let instance = linker()?
-            .instantiate(&mut store, &module)
-            .context("instantiating the emulator module")?;
+        let (mut store, instance, memory) = instantiate(&module, None)?;
 
         let abi_version = instance
             .get_typed_func::<(), u32>(&mut store, "ggo_abi_version")
@@ -184,9 +234,6 @@ impl LoadedEmulator {
             abi_minor(abi_version),
         );
 
-        let memory = instance
-            .get_memory(&mut store, "memory")
-            .context("emulator module exports no memory")?;
         let commit_ptr = instance
             .get_typed_func::<(), u32>(&mut store, "ggo_build_commit_ptr")?
             .call(&mut store, ())? as usize;
@@ -198,6 +245,12 @@ impl LoadedEmulator {
             .get(byte_range(commit_ptr, commit_len).context("build commit range overflows")?)
             .map(|raw| String::from_utf8_lossy(raw).into_owned())
             .filter(|commit| !commit.is_empty());
+
+        // Every session start resolves these, so a module missing one must
+        // fail the load rather than each cart.
+        let mut guest = Guest::from_parts(store, instance, memory)?;
+        EmuFuncs::resolve(&mut guest)?;
+        ApuFuncs::resolve(&mut guest)?;
 
         Ok(LoadedEmulator {
             label: label.into(),
@@ -287,9 +340,21 @@ struct Guest {
 
 impl Guest {
     fn new(module: &Module, card_dir: Option<PathBuf>) -> Result<Guest> {
-        let (mut store, instance, memory) = instantiate(module, card_dir)?;
-        let alloc = instance.get_typed_func(&mut store, "ggo_alloc")?;
-        let free = instance.get_typed_func(&mut store, "ggo_free")?;
+        let (store, instance, memory) = instantiate(module, card_dir)?;
+        Guest::from_parts(store, instance, memory)
+    }
+
+    fn from_parts(
+        mut store: Store<HostState>,
+        instance: Instance,
+        memory: Memory,
+    ) -> Result<Guest> {
+        let alloc = instance
+            .get_typed_func(&mut store, "ggo_alloc")
+            .context("emulator module export ggo_alloc is missing or mismatched")?;
+        let free = instance
+            .get_typed_func(&mut store, "ggo_free")
+            .context("emulator module export ggo_free is missing or mismatched")?;
         Ok(Guest {
             store,
             instance,
@@ -781,33 +846,59 @@ mod tests {
         vsyncs
     }
 
-    /// A hand-written module exporting only `ggo_abi_version() -> version`.
-    fn wat_free_abi_module(version: u32) -> Vec<u8> {
-        let mut sleb = Vec::new();
-        let mut value = version as i32;
-        loop {
-            let byte = (value & 0x7F) as u8;
-            value >>= 7;
-            if (value == 0 && byte & 0x40 == 0) || (value == -1 && byte & 0x40 != 0) {
-                sleb.push(byte);
-                break;
-            }
-            sleb.push(byte | 0x80);
-        }
-        let name = b"ggo_abi_version";
-        let mut body = vec![0x00, 0x41];
-        body.extend(&sleb);
-        body.push(0x0B);
+    /// A hand-built module with a `memory` export and `ggo_abi_version`,
+    /// plus the build-commit exports when `with_commit` is set. `grow(pages)`
+    /// calls `memory.grow`. It exports none of the emulator functions.
+    fn tiny_module(version: u32, with_commit: bool, min_pages: u64) -> Vec<u8> {
+        use wasm_encoder::{
+            CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction,
+            MemorySection, MemoryType, Module, TypeSection, ValType,
+        };
+        let mut types = TypeSection::new();
+        types.ty().function([], [ValType::I32]);
+        types.ty().function([ValType::I32], [ValType::I32]);
+        let mut functions = FunctionSection::new();
+        let mut code = CodeSection::new();
+        let mut exports = ExportSection::new();
+        let mut memories = MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: min_pages,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        exports.export("memory", ExportKind::Memory, 0);
 
-        let mut module = b"\0asm\x01\0\0\0".to_vec();
-        module.extend([0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7F]);
-        module.extend([0x03, 0x02, 0x01, 0x00]);
-        module.extend([0x07, (name.len() + 4) as u8, 0x01, name.len() as u8]);
-        module.extend(name);
-        module.extend([0x00, 0x00]);
-        module.extend([0x0A, (body.len() + 2) as u8, 0x01, body.len() as u8]);
-        module.extend(body);
-        module
+        let mut constants = vec![("ggo_abi_version", version as i32)];
+        if with_commit {
+            constants.push(("ggo_build_commit_ptr", 0));
+            constants.push(("ggo_build_commit_len", 0));
+        }
+        for (index, (name, value)) in constants.into_iter().enumerate() {
+            functions.function(0);
+            let mut body = Function::new([]);
+            body.instruction(&Instruction::I32Const(value));
+            body.instruction(&Instruction::End);
+            code.function(&body);
+            exports.export(name, ExportKind::Func, index as u32);
+        }
+        let grow_index = functions.len();
+        functions.function(1);
+        let mut body = Function::new([]);
+        body.instruction(&Instruction::LocalGet(0));
+        body.instruction(&Instruction::MemoryGrow(0));
+        body.instruction(&Instruction::End);
+        code.function(&body);
+        exports.export("grow", ExportKind::Func, grow_index);
+
+        let mut module = Module::new();
+        module.section(&types);
+        module.section(&functions);
+        module.section(&memories);
+        module.section(&exports);
+        module.section(&code);
+        module.finish()
     }
 
     #[test]
@@ -821,11 +912,42 @@ mod tests {
 
     #[test]
     fn a_module_with_the_wrong_abi_major_is_rejected() {
-        let bytes = wat_free_abi_module(2 << 16);
+        let bytes = tiny_module(2 << 16, true, 1);
         let error = LoadedEmulator::compile(&bytes, "bad")
             .err()
             .expect("rejected");
         assert!(error.to_string().contains("ABI"), "{error}");
+    }
+
+    #[test]
+    fn a_module_missing_emulator_exports_fails_at_load() {
+        let bytes = tiny_module(1 << 16, true, 1);
+        let error = LoadedEmulator::compile(&bytes, "incomplete")
+            .err()
+            .expect("rejected");
+        assert!(format!("{error:#}").contains("ggo_"), "{error:#}");
+        assert!(format!("{error:#}").contains("missing"), "{error:#}");
+    }
+
+    #[test]
+    fn guest_memory_growth_is_capped() {
+        let module = Module::new(engine().expect("engine"), tiny_module(1 << 16, false, 1))
+            .expect("compiles");
+        let (mut store, instance, _memory) = instantiate(&module, None).expect("instantiates");
+        let grow = instance
+            .get_typed_func::<i32, i32>(&mut store, "grow")
+            .expect("grow export");
+        assert!(grow.call(&mut store, 1).expect("small growth") >= 0);
+        let over_the_cap = (MAX_GUEST_MEMORY_BYTES / 65536) as i32 + 1;
+        assert_eq!(grow.call(&mut store, over_the_cap).expect("grow call"), -1);
+    }
+
+    #[test]
+    fn a_module_declaring_memory_past_the_cap_fails_to_instantiate() {
+        let pages = (MAX_GUEST_MEMORY_BYTES / 65536) as u64 + 1;
+        let module = Module::new(engine().expect("engine"), tiny_module(1 << 16, false, pages))
+            .expect("compiles");
+        assert!(instantiate(&module, None).is_err());
     }
 
     #[test]
@@ -895,6 +1017,19 @@ mod tests {
         assert_eq!(read_card_file(dir.path(), "inside.bin"), Some(vec![7u8; 4]));
         assert_eq!(read_card_file(dir.path(), "../outside.bin"), None);
         assert_eq!(read_card_file(dir.path(), "/etc/passwd"), None);
+    }
+
+    #[test]
+    fn oversized_card_files_are_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = std::fs::File::create(dir.path().join("big.bin")).expect("create");
+        file.set_len(MAX_CARD_FILE_BYTES + 1).expect("size");
+        assert_eq!(read_card_file(dir.path(), "big.bin"), None);
+        file.set_len(MAX_CARD_FILE_BYTES).expect("size");
+        assert_eq!(
+            read_card_file(dir.path(), "big.bin").map(|bytes| bytes.len() as u64),
+            Some(MAX_CARD_FILE_BYTES)
+        );
     }
 
     #[test]

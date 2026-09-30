@@ -252,10 +252,23 @@ fn same_origin(first: &str, second: &str) -> bool {
     }
 }
 
+/// Far above a real emulator module; a server streaming more than this is
+/// not serving one.
+const MAX_DOWNLOAD_BYTES: u64 = 64 << 20;
+
 async fn get_bytes(
     http: Arc<dyn HttpClient>,
     url: String,
     token: Option<String>,
+) -> Result<Vec<u8>> {
+    get_bytes_limited(http, url, token, MAX_DOWNLOAD_BYTES).await
+}
+
+async fn get_bytes_limited(
+    http: Arc<dyn HttpClient>,
+    url: String,
+    token: Option<String>,
+    limit: u64,
 ) -> Result<Vec<u8>> {
     let mut request = http_client::Request::builder()
         .method(http_client::Method::GET)
@@ -276,7 +289,15 @@ async fn get_bytes(
         response.status()
     );
     let mut body = Vec::new();
-    response.body_mut().read_to_end(&mut body).await?;
+    response
+        .body_mut()
+        .take(limit + 1)
+        .read_to_end(&mut body)
+        .await?;
+    ensure!(
+        body.len() as u64 <= limit,
+        "GET {url}: response is larger than {limit} bytes"
+    );
     Ok(body)
 }
 
@@ -385,6 +406,27 @@ mod tests {
             .expect("list")
             .remove(0);
         assert!(futures::executor::block_on(bad.fetch(&version)).is_err());
+    }
+
+    #[test]
+    fn a_download_past_the_size_limit_is_an_error() {
+        let http = FakeHttpClient::create(|_| async move {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(vec![0u8; 11].into())?)
+        });
+        let url = "https://host/big.wasm".to_string();
+        let error = futures::executor::block_on(get_bytes_limited(
+            http.clone(),
+            url.clone(),
+            None,
+            10,
+        ))
+        .expect_err("over the limit");
+        assert!(error.to_string().contains("larger than"), "{error}");
+        let bytes = futures::executor::block_on(get_bytes_limited(http, url, None, 11))
+            .expect("at the limit");
+        assert_eq!(bytes.len(), 11);
     }
 
     #[gpui::test]
