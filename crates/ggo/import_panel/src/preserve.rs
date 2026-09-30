@@ -70,10 +70,9 @@ pub(crate) fn check(old: &SpriteState, new: &SpriteState) -> Result<(), Mismatch
 /// Carry `old`'s animation work onto `new`'s artwork: the clips come over
 /// WHOLE, each entry keeping the frame it points at (matched by position
 /// -- frame `i` is still frame `i`) along with the duration, flip, offset
-/// and transform it plays at. Frames are artwork only (a tile-ref grid),
-/// so there is nothing on them to preserve; everything the user authored
-/// rides on the clip entries. Frames the old document never had are
-/// simply not referenced by any clip.
+/// and transform it plays at, and each frame keeps its pixel offset.
+/// Frames the old document never had are simply not referenced by any
+/// clip.
 ///
 /// Only meaningful after [`check`] has passed, but written not to depend
 /// on it: a clip with ANY entry past `new`'s frame list is DROPPED rather
@@ -87,6 +86,10 @@ pub(crate) fn merge(old: &SpriteState, mut new: SpriteState) -> SpriteState {
         .filter(|clip| clip.entries.iter().all(|e| e.frame < frame_count))
         .cloned()
         .collect();
+    // Frame i is still frame i: its alignment offset comes over with it.
+    for (frame, old_frame) in new.frames.iter_mut().zip(&old.frames) {
+        frame.offset = old_frame.offset;
+    }
     new
 }
 
@@ -178,7 +181,7 @@ mod tests {
     use ggo_worldlib::sprites::hw::TILE_BYTES;
 
     fn frame() -> Frame {
-        Frame { map: vec![0] }
+        Frame { offset: (0, 0), map: vec![0] }
     }
 
     fn state(frames: usize, footprint: (u8, u8)) -> SpriteState {
@@ -202,6 +205,18 @@ mod tests {
             loop_: true,
             entries: (from..=to).map(ClipEntry::of_frame).collect(),
         }
+    }
+
+    /// Frame `i` is still frame `i`, so its alignment offset survives a
+    /// re-import; a frame the old document never had starts at (0, 0).
+    #[test]
+    fn merge_keeps_each_frames_offset() {
+        let mut old = state(2, (1, 1));
+        old.frames[1].offset = (5, -2);
+        let merged = merge(&old, state(3, (1, 1)));
+        assert_eq!(merged.frames[0].offset, (0, 0));
+        assert_eq!(merged.frames[1].offset, (5, -2), "frame i keeps frame i's alignment");
+        assert_eq!(merged.frames[2].offset, (0, 0), "a frame the old doc never had");
     }
 
     /// The workflow this exists for: the artist appended frames, so every

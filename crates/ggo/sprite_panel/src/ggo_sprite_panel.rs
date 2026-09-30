@@ -1381,6 +1381,10 @@ enum EditTarget {
     ShearY,
     OffsetX,
     OffsetY,
+    /// The selected FRAME's pixel offset (`.spr` v7) -- shared by every
+    /// clip entry that shows the frame, unlike `OffsetX/Y`.
+    FrameOffsetX,
+    FrameOffsetY,
 }
 
 /// One panel text input: the target it edits and the single-line editor
@@ -1534,15 +1538,39 @@ struct Shown {
     frame: usize,
     transform: FrameTransform,
     flip: (bool, bool),
-    /// The clip entry's own pixel offset, as the device applies it;
-    /// `(0, 0)` for a thumbnail, whose image ignores it.
+    /// The frame's pixel offset plus the entry's own, as the device
+    /// applies them; `(0, 0)` for a thumbnail, whose image ignores it.
     offset: (i16, i16),
 }
 
 /// The offset of nothing: a thumbnail's image is drawn unshifted.
 const NO_OFFSET: (i16, i16) = (0, 0);
+const NO_FLIP: (bool, bool) = (false, false);
 
 impl OpenSprite {
+    /// The device's placement of `frame`'s tiles: the frame's offset
+    /// (mirrored per axis by the entry's flip) plus the clip entry's,
+    /// wrapping like the ABI's i16 math.
+    fn placed_offset(
+        &self,
+        frame: usize,
+        entry: (i16, i16),
+        flip: (bool, bool),
+    ) -> (i16, i16) {
+        let base = self
+            .store
+            .state()
+            .frames
+            .get(frame)
+            .map_or(NO_OFFSET, |f| f.offset);
+        // Flip mirrors the frame's offset about the footprint centre; the
+        // entry's own offset is never mirrored.
+        let mirror = |v: i16, flipped: bool| if flipped { v.wrapping_neg() } else { v };
+        (
+            mirror(base.0, flip.0).wrapping_add(entry.0),
+            mirror(base.1, flip.1).wrapping_add(entry.1),
+        )
+    }
 
     fn new(
         rel_path: String,
@@ -1602,13 +1630,17 @@ impl OpenSprite {
                 frame: entry.frame,
                 transform: entry.transform,
                 flip: (entry.flip_h, entry.flip_v),
-                offset: entry.offset,
+                offset: self.placed_offset(
+                    entry.frame,
+                    entry.offset,
+                    (entry.flip_h, entry.flip_v),
+                ),
             },
             None => Shown {
                 frame: position,
                 transform: FrameTransform::IDENTITY,
                 flip: (false, false),
-                offset: NO_OFFSET,
+                offset: self.placed_offset(position, NO_OFFSET, NO_FLIP),
             },
         }
     }
@@ -1629,14 +1661,18 @@ impl OpenSprite {
                 frame: entry.frame,
                 transform: entry.transform,
                 flip: (entry.flip_h, entry.flip_v),
-                offset: entry.offset,
+                offset: self.placed_offset(
+                    entry.frame,
+                    entry.offset,
+                    (entry.flip_h, entry.flip_v),
+                ),
             };
         }
         Shown {
             frame: self.selected_frame,
             transform: FrameTransform::IDENTITY,
             flip: (false, false),
-            offset: NO_OFFSET,
+            offset: self.placed_offset(self.selected_frame, NO_OFFSET, NO_FLIP),
         }
     }
 
@@ -2826,6 +2862,7 @@ impl SpritePanel {
             "dirty": open.store.dirty(),
             "tileset": { "stem": stem(&open.til_path), "rel_path": open.til_path },
             "frame_count": state.frames.len(),
+            "frame_offsets": state.frames.iter().map(|f| [f.offset.0, f.offset.1]).collect::<Vec<_>>(),
             "frame_size": {
                 "tiles": [state.w_tiles, state.h_tiles],
                 "pixels": [
@@ -4025,6 +4062,27 @@ impl SpritePanel {
                     cx,
                 );
             }
+            EditTarget::FrameOffsetX | EditTarget::FrameOffsetY => {
+                let frame = open.selected_frame;
+                let Some(current) = open.store.state().frames.get(frame).map(|f| f.offset) else {
+                    cx.notify();
+                    return;
+                };
+                let Ok(v) = text.trim().parse::<i16>() else {
+                    cx.notify(); // dropped -- editor re-syncs
+                    return;
+                };
+                let offset = if target == EditTarget::FrameOffsetX {
+                    (v, current.1)
+                } else {
+                    (current.0, v)
+                };
+                if offset == current {
+                    cx.notify();
+                    return;
+                }
+                self.apply_doc(DocOp::FrameOffsetSet { frame, offset }, cx);
+            }
             EditTarget::Duration
             | EditTarget::Rot
             | EditTarget::ScaleX
@@ -4113,12 +4171,26 @@ impl SpritePanel {
         target: &EditTarget,
         state: &SpriteState,
         selected_entry: Option<(usize, usize)>,
+        selected_frame: usize,
     ) -> String {
         if let EditTarget::ClipName(i) = target {
             return state
                 .clips
                 .get(*i)
                 .map_or_else(String::new, |c| c.name.clone());
+        }
+        if matches!(target, EditTarget::FrameOffsetX | EditTarget::FrameOffsetY) {
+            return state
+                .frames
+                .get(selected_frame)
+                .map_or_else(String::new, |f| {
+                    if *target == EditTarget::FrameOffsetX {
+                        f.offset.0
+                    } else {
+                        f.offset.1
+                    }
+                    .to_string()
+                });
         }
         // Every other field edits the selected ENTRY; with none selected
         // the inputs read blank rather than showing a stale value.
@@ -4136,7 +4208,9 @@ impl SpritePanel {
             EditTarget::ShearY => edits::format_fixed88(entry.transform.shear_y),
             EditTarget::OffsetX => entry.offset.0.to_string(),
             EditTarget::OffsetY => entry.offset.1.to_string(),
-            EditTarget::ClipName(_) => String::new(),
+            EditTarget::ClipName(_)
+            | EditTarget::FrameOffsetX
+            | EditTarget::FrameOffsetY => String::new(),
         }
     }
 
@@ -4162,6 +4236,8 @@ impl SpritePanel {
         targets.push(EditTarget::ShearY);
         targets.push(EditTarget::OffsetX);
         targets.push(EditTarget::OffsetY);
+        targets.push(EditTarget::FrameOffsetX);
+        targets.push(EditTarget::FrameOffsetY);
 
         let same_targets = open.editors.len() == targets.len()
             && open
@@ -4180,6 +4256,7 @@ impl SpritePanel {
                     &entry.target,
                     state,
                     open.selected_entry,
+                    open.selected_frame,
                 );
                 if entry.editor.read(cx).text(cx) != text {
                     entry
@@ -4196,6 +4273,7 @@ impl SpritePanel {
                 &target,
                 open.store.state(),
                 open.selected_entry,
+                open.selected_frame,
             );
             let editor = cx.new(|cx| {
                 let mut editor = Editor::single_line(window, cx);
@@ -5589,6 +5667,16 @@ impl SpritePanel {
             .child(labelled("dx", 48., EditTarget::OffsetX))
             .child(labelled("dy", 48., EditTarget::OffsetY))
             .child(
+                Label::new(format!(
+                    "Frame {} offset (all clips)",
+                    open.selected_frame + 1
+                ))
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+            )
+            .child(labelled("fdx", 48., EditTarget::FrameOffsetX))
+            .child(labelled("fdy", 48., EditTarget::FrameOffsetY))
+            .child(
                 h_flex()
                     .gap_2()
                     .child(
@@ -5899,7 +5987,7 @@ pub(crate) mod test_fixtures {
             tile_count: 3,
             session_tiles: std::collections::HashSet::new(),
             palette,
-            frames: vec![Frame { map: vec![0] }],
+            frames: vec![Frame { offset: (0, 0), map: vec![0] }],
             clips: vec![],
             w_tiles: 1,
             h_tiles: 1,
@@ -5932,7 +6020,7 @@ pub(crate) mod test_fixtures {
             tile_count: 2,
             session_tiles: std::collections::HashSet::new(),
             palette,
-            frames: vec![Frame { map: vec![0] }, Frame { map: vec![1] }],
+            frames: vec![Frame { offset: (0, 0), map: vec![0] }, Frame { offset: (0, 0), map: vec![1] }],
             clips: vec![ClipEdit {
                 name: "walk".to_string(),
                 loop_: false,
@@ -6680,6 +6768,7 @@ mod tests {
                     &EditTarget::Rot,
                     ready(panel).store.state(),
                     Some((0, 0)),
+                    ready(panel).selected_frame
                 ),
                 "90"
             );
@@ -6688,6 +6777,7 @@ mod tests {
                     &EditTarget::ScaleX,
                     ready(panel).store.state(),
                     Some((0, 0)),
+                    ready(panel).selected_frame
                 ),
                 "2.50"
             );
@@ -8479,6 +8569,36 @@ mod tests {
             assert_eq!(entry.offset, (4, -6));
             assert_eq!((entry.flip_h, entry.flip_v), (true, false));
             assert_eq!(ready(panel).store.state().frames.len(), 2);
+        });
+    }
+
+    /// The frame offset fields edit the SELECTED FRAME (every clip that
+    /// shows it), not the selected entry, in one undo step each; junk
+    /// input is dropped.
+    #[gpui::test]
+    async fn test_frame_offset_fields_edit_the_selected_frame(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.select_entry(0, 1, cx);
+            let frame = ready(panel).selected_frame;
+            let entry_before = ready(panel).store.state().clips[0].entries[1];
+            panel.commit_edit(EditTarget::FrameOffsetX, "-3".into(), cx);
+            panel.commit_edit(EditTarget::FrameOffsetY, "7".into(), cx);
+            panel.commit_edit(EditTarget::FrameOffsetY, "nope".into(), cx);
+            let state = ready(panel).store.state();
+            assert_eq!(state.frames[frame].offset, (-3, 7));
+            assert_eq!(state.clips[0].entries[1], entry_before, "entry untouched");
+            assert_eq!(
+                SpritePanel::edit_display_text(
+                    &EditTarget::FrameOffsetX,
+                    state,
+                    ready(panel).selected_entry,
+                    ready(panel).selected_frame
+                ),
+                "-3"
+            );
         });
     }
 
@@ -11878,18 +11998,45 @@ mod tests {
         );
     }
 
-    /// `shown()` carries the selected entry's own offset, which is what
-    /// the device places the frame's tiles by.
+    /// `shown()` carries frame + entry offset so the preview draws where
+    /// the device will.
     #[gpui::test]
-    async fn test_shown_offset_is_the_selected_entrys(cx: &mut TestAppContext) {
+    async fn test_shown_offset_mirrors_frame_offset_under_entry_flip(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let panel = ready_panel(cx, dir.path()).await;
         panel.update(cx, |panel, cx| {
             panel.select_entry(0, 1, cx);
+            let frame = ready(panel).selected_frame;
+            panel.apply_doc(DocOp::FrameOffsetSet { frame, offset: (2, 3) }, cx);
             panel.commit_edit(EditTarget::OffsetX, "10".into(), cx);
-            panel.commit_edit(EditTarget::OffsetY, "3".into(), cx);
-            assert_eq!(ready(panel).shown().offset, (10, 3));
+            panel.set_entry_flip(0, 1, true, false, cx);
+            // dx mirrors (-2 + 10); dy and the entry offset do not.
+            assert_eq!(ready(panel).shown().offset, (8, 3));
         });
+    }
+
+    #[gpui::test]
+    async fn test_shown_offset_sums_frame_and_entry(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.select_entry(0, 1, cx);
+            let frame = ready(panel).selected_frame;
+            panel.apply_doc(DocOp::FrameOffsetSet { frame, offset: (2, 3) }, cx);
+            panel.commit_edit(EditTarget::OffsetX, "10".into(), cx);
+            assert_eq!(ready(panel).shown().offset, (12, 3));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_remote_read_lists_frame_offsets(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let panel = ready_panel(cx, dir.path()).await;
+        panel.update(cx, |panel, cx| {
+            panel.apply_doc(DocOp::FrameOffsetSet { frame: 1, offset: (4, -1) }, cx);
+        });
+        let read = panel.read_with(cx, |panel, _| panel.remote_read()).unwrap();
+        assert_eq!(read["frame_offsets"], serde_json::json!([[0, 0], [4, -1]]));
     }
 
     #[gpui::test]

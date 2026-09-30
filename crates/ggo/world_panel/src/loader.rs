@@ -104,11 +104,9 @@ pub fn load_world(project_dir: &Path, rel: &str) -> Result<LoadedWorld, String> 
 
     // Asset composition -- ggo-ide's `dispatch_new_asset_loads` target set:
     // `collect_load_targets` for entities/subtrees, plus the merged
-    // background stems. `collect_load_targets` reports map stems of its
-    // own (entity tilemaps), but the merged set stays the only source of
-    // background map loads: it is the one that has resolved layer order
-    // and per-layer overrides, which a bare stem list cannot express.
-    let (sprite_stems, _entity_map_stems, meta_targets) = collect_load_targets(&state);
+    // background stems (the merged set is the only source of background map
+    // loads; `collect_load_targets` never reports background stems).
+    let (sprite_stems, meta_targets) = collect_load_targets(&state);
     let mut sprite_loads = AssetLoads::new();
     for stem in sprite_stems {
         let load = settle(compose_sprite_rgba(project_dir, &stem));
@@ -278,9 +276,7 @@ pub fn fill_missing_asset_loads(
     sprite_loads: &mut AssetLoads,
     meta_sprite_loads: &mut AssetLoads,
 ) {
-    // The maps element is the caller's own business: background map loads
-    // come from the merged background set, which this function is not given.
-    let (sprite_stems, _entity_map_stems, meta_targets) = collect_load_targets(state);
+    let (sprite_stems, meta_targets) = collect_load_targets(state);
     for stem in sprite_stems {
         sprite_loads
             .entry(stem.clone())
