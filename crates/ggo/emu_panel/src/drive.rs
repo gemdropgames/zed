@@ -5,11 +5,11 @@
 //!
 //! ## Why an OS thread and not `cx.background_spawn`
 //!
-//! A `WasmEmu` owns a wasmtime store, and a turn can run for up to
-//! 5 million instructions (the module's per-turn budget), so the drive loop is blocking work
-//! with a per-frame pacing sleep. A plain `std::thread::spawn` keeps it off
-//! the executors entirely; the emulator instance is constructed inside the
-//! thread and never crosses a boundary.
+//! A `WasmEmu` owns a wasmtime store, and a turn can run for up to 5
+//! million instructions (the module's per-turn budget), so the drive loop
+//! is blocking work with a per-frame pacing sleep. A plain
+//! `std::thread::spawn` keeps it off the executors entirely; the emulator
+//! instance is constructed inside the thread and never crosses a boundary.
 //!
 //! ## How a run ends, and where its perf data comes from
 //!

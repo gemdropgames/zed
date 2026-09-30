@@ -15,10 +15,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use base64::Engine as _;
-use ggo_emu_remote::protocol::{Cmd, Request, Response, parse_request, response_line};
-use ggo_emu_remote::registry::{self, SessionInfo};
 use gpui::{AnyWindowHandle, App, AppContext as _, AsyncApp, Context, Entity, Global, WeakEntity};
 use workspace::Workspace;
+use ggo_emu_remote::protocol::{Cmd, Request, Response, parse_request, response_line};
+use ggo_emu_remote::registry::{self, SessionInfo};
 
 use crate::EmuPanel;
 use crate::input::{SELECT_BIT, button_bit};
@@ -83,18 +83,8 @@ fn publish_advertisement_roots(mut workspaces: Vec<String>) {
     let dir = registry::dir();
     let pid = std::process::id();
     let (_, socket) = registry::session_paths(&dir, pid);
-    if let Err(e) = registry::publish(
-        &dir,
-        &SessionInfo {
-            pid,
-            socket,
-            workspaces,
-        },
-    ) {
-        log::warn!(
-            "zedgg-emu remote: advertising under {} failed: {e}",
-            dir.display()
-        );
+    if let Err(e) = registry::publish(&dir, &SessionInfo { pid, socket, workspaces }) {
+        log::warn!("zedgg-emu remote: advertising under {} failed: {e}", dir.display());
     }
 }
 
@@ -118,9 +108,7 @@ pub fn init(cx: &mut App) {
             if cx.try_global::<RemotePanels>().is_none() {
                 cx.set_global(RemotePanels::default());
             }
-            cx.global_mut::<RemotePanels>()
-                .workspaces
-                .insert(id, (weak, handle));
+            cx.global_mut::<RemotePanels>().workspaces.insert(id, (weak, handle));
         });
     })
     .detach();
@@ -233,12 +221,7 @@ pub fn buttons_to_mask(buttons: &[String]) -> Result<u32, String> {
 fn live_workspaces(cx: &mut App) -> Vec<(String, Entity<Workspace>, Option<AnyWindowHandle>)> {
     let tracked: Vec<(u64, WeakEntity<Workspace>, Option<AnyWindowHandle>)> = cx
         .try_global::<RemotePanels>()
-        .map(|g| {
-            g.workspaces
-                .iter()
-                .map(|(id, (w, h))| (*id, w.clone(), *h))
-                .collect()
-        })
+        .map(|g| g.workspaces.iter().map(|(id, (w, h))| (*id, w.clone(), *h)).collect())
         .unwrap_or_default();
     let mut out = Vec::new();
     let mut dead = Vec::new();
@@ -247,21 +230,15 @@ fn live_workspaces(cx: &mut App) -> Vec<(String, Entity<Workspace>, Option<AnyWi
             dead.push(id);
             continue;
         };
-        let root = workspace
-            .read(cx)
-            .project()
-            .read(cx)
-            .visible_worktrees(cx)
-            .next()
-            .map(|worktree| worktree.read(cx).abs_path().to_string_lossy().into_owned());
+        let root = workspace.read(cx).project().read(cx).visible_worktrees(cx).next().map(
+            |worktree| worktree.read(cx).abs_path().to_string_lossy().into_owned(),
+        );
         if let Some(root) = root {
             out.push((root, workspace, handle));
         }
     }
     if !dead.is_empty() {
-        cx.global_mut::<RemotePanels>()
-            .workspaces
-            .retain(|id, _| !dead.contains(id));
+        cx.global_mut::<RemotePanels>().workspaces.retain(|id, _| !dead.contains(id));
     }
     out
 }
@@ -296,28 +273,21 @@ async fn await_frame(
             return Ok(frame);
         }
         if !running {
-            return Err(format!(
-                "run ended at frame {frame} before frame {target_frame}"
-            ));
+            return Err(format!("run ended at frame {frame} before frame {target_frame}"));
         }
         if std::time::Instant::now() >= deadline {
             return Err(format!(
                 "timed out at frame {frame} waiting for frame {target_frame}"
             ));
         }
-        cx.background_executor()
-            .timer(std::time::Duration::from_millis(5))
-            .await;
+        cx.background_executor().timer(std::time::Duration::from_millis(5)).await;
     }
 }
 
 /// The world half of a lock-step reply: the cart's inspection JSON parsed
 /// into a value (`null` for worlds that don't declare `InspectWorld`).
 fn world_value(panel: &WeakEntity<EmuPanel>, cx: &mut AsyncApp) -> serde_json::Value {
-    let dump = panel
-        .update(cx, |p, _| p.remote_world_json())
-        .ok()
-        .flatten();
+    let dump = panel.update(cx, |p, _| p.remote_world_json()).ok().flatten();
     match dump {
         Some((seq, json)) => match serde_json::from_str::<serde_json::Value>(&json) {
             Ok(mut v) => {
@@ -345,10 +315,7 @@ fn resolve_write_path(target_root: &str, path: &str) -> String {
     if path.is_absolute() {
         path.to_string_lossy().into_owned()
     } else {
-        std::path::Path::new(target_root)
-            .join(path)
-            .to_string_lossy()
-            .into_owned()
+        std::path::Path::new(target_root).join(path).to_string_lossy().into_owned()
     }
 }
 
@@ -453,8 +420,12 @@ fn world_panel_open(
                         // reads, and in Live each of those boots its own
                         // headless emulator run for a picture nobody is
                         // looking at.
-                        opened =
-                            dock.open_world_in(&rel, ggo_world_panel::OpenMode::Design, window, cx);
+                        opened = dock.open_world_in(
+                            &rel,
+                            ggo_world_panel::OpenMode::Design,
+                            window,
+                            cx,
+                        );
                     },
                 );
                 opened
@@ -485,9 +456,7 @@ async fn await_world_ready<T>(
                 if reason.contains(ggo_world_panel::WORLD_STILL_LOADING)
                     && std::time::Instant::now() < deadline =>
             {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(50))
-                    .await;
+                cx.background_executor().timer(std::time::Duration::from_millis(50)).await;
             }
             Err(reason) => return Err(reason),
         }
@@ -563,9 +532,7 @@ fn sprite_panel_open(
                     .find(|item| item.read(cx).rel() == rel)
                     .map(|item| item.read(cx).panel().clone())
             });
-            panel
-                .map(|panel| (panel, rel))
-                .ok_or_else(|| "the sprite tab could not open".to_string())
+            panel.map(|panel| (panel, rel)).ok_or_else(|| "the sprite tab could not open".to_string())
         })
         .map_err(|e| e.to_string())?
 }
@@ -597,9 +564,7 @@ async fn await_sprite_ready<T>(
         match panel.update(cx, |p, _| read(p)) {
             Ok(value) => return Ok(value),
             Err(reason) if sprite_settling(&reason) && std::time::Instant::now() < deadline => {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(50))
-                    .await;
+                cx.background_executor().timer(std::time::Duration::from_millis(50)).await;
             }
             Err(reason) => return Err(reason),
         }
@@ -613,19 +578,14 @@ async fn await_sprite_ready<T>(
 async fn await_sprite_ready_mut<T>(
     panel: &Entity<ggo_sprite_panel::SpritePanel>,
     cx: &mut AsyncApp,
-    mut write: impl FnMut(
-        &mut ggo_sprite_panel::SpritePanel,
-        &mut Context<ggo_sprite_panel::SpritePanel>,
-    ) -> Result<T, String>,
+    mut write: impl FnMut(&mut ggo_sprite_panel::SpritePanel, &mut Context<ggo_sprite_panel::SpritePanel>) -> Result<T, String>,
 ) -> Result<T, String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         match panel.update(cx, |p, cx| write(p, cx)) {
             Ok(value) => return Ok(value),
             Err(reason) if sprite_settling(&reason) && std::time::Instant::now() < deadline => {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(50))
-                    .await;
+                cx.background_executor().timer(std::time::Duration::from_millis(50)).await;
             }
             Err(reason) => return Err(reason),
         }
@@ -791,9 +751,8 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
             .unwrap_or_default();
         // A closed panel must fall through to the workspace path (which
         // reopens it) rather than shadowing its root with a dead entity.
-        let (live, dead): (Vec<_>, Vec<_>) = panels
-            .into_iter()
-            .partition(|(_, p, _)| p.upgrade().is_some());
+        let (live, dead): (Vec<_>, Vec<_>) =
+            panels.into_iter().partition(|(_, p, _)| p.upgrade().is_some());
         if !dead.is_empty() {
             let g = cx.global_mut::<RemotePanels>();
             for (root, ..) in &dead {
@@ -812,12 +771,7 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
         for (root, workspace, window) in live_workspaces(cx) {
             match targets.iter_mut().find(|t| t.root == root) {
                 Some(t) => t.workspace = Some(workspace),
-                None => targets.push(Target {
-                    root,
-                    panel: None,
-                    workspace: Some(workspace),
-                    window,
-                }),
+                None => targets.push(Target { root, panel: None, workspace: Some(workspace), window }),
             }
         }
         // Keep the on-disk advertisement in step with live worktrees —
@@ -825,10 +779,7 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
         let mut roots: Vec<String> = targets.iter().map(|t| t.root.clone()).collect();
         roots.sort();
         roots.dedup();
-        if cx
-            .try_global::<RemotePanels>()
-            .is_some_and(|g| g.advertised != roots)
-        {
+        if cx.try_global::<RemotePanels>().is_some_and(|g| g.advertised != roots) {
             cx.global_mut::<RemotePanels>().advertised = roots.clone();
             publish_advertisement_roots(roots);
         }
@@ -949,17 +900,13 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
     // without stepping it or stopping it.
     if let Cmd::Screenshot { .. } = cmd {
         let panel = target.panel.ok_or("no emu panel open in this workspace")?;
-        let shot = panel
-            .update(cx, |p, _| p.remote_screenshot())
-            .map_err(|e| e.to_string())?;
+        let shot = panel.update(cx, |p, _| p.remote_screenshot()).map_err(|e| e.to_string())?;
         let (width, height, bgra) = shot.ok_or("no frame presented yet — start a run first")?;
         return Ok(bgra_reply(width, height, &bgra));
     }
     if let Cmd::Uart { tail, .. } = &cmd {
         let panel = target.panel.ok_or("no emu panel open in this workspace")?;
-        let lines = panel
-            .update(cx, |p, _| p.remote_uart(*tail))
-            .map_err(|e| e.to_string())?;
+        let lines = panel.update(cx, |p, _| p.remote_uart(*tail)).map_err(|e| e.to_string())?;
         return Ok(serde_json::json!({ "lines": lines }));
     }
     // Pausing and resuming likewise only touch the live session, so they
@@ -968,41 +915,23 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
         let panel = target.panel.ok_or("no run live — emu_start first")?;
         let paused = matches!(cmd, Cmd::Pause { .. });
         panel
-            .update(cx, |p, _| {
-                if paused {
-                    p.remote_pause()
-                } else {
-                    p.remote_resume()
-                }
-            })
+            .update(cx, |p, _| if paused { p.remote_pause() } else { p.remote_resume() })
             .map_err(|e| e.to_string())??;
-        let (frame, running, _) = panel
-            .update(cx, |p, _| p.remote_progress())
-            .map_err(|e| e.to_string())?;
+        let (frame, running, _) =
+            panel.update(cx, |p, _| p.remote_progress()).map_err(|e| e.to_string())?;
         return Ok(serde_json::json!({ "paused": paused, "frame": frame, "running": running }));
     }
     // Pre-window as well: every inspector view is decoded from the
     // snapshot the drive thread already published, so an agent can look
     // at a run it did not start and has no window handle for.
-    if let Cmd::Debug {
-        view,
-        bank,
-        palette,
-        layer,
-        ..
-    } = &cmd
-    {
+    if let Cmd::Debug { view, bank, palette, layer, .. } = &cmd {
         let panel = target.panel.ok_or("no run live — emu_start first")?;
         return panel
-            .update(cx, |p, _| {
-                p.remote_debug_view(*view, *bank, *palette, *layer)
-            })
+            .update(cx, |p, _| p.remote_debug_view(*view, *bank, *palette, *layer))
             .map_err(|e| e.to_string())?;
     }
 
-    let window = target
-        .window
-        .ok_or("workspace has no window (headless test?)")?;
+    let window = target.window.ok_or("workspace has no window (headless test?)")?;
 
     match cmd {
         Cmd::Status
@@ -1014,20 +943,9 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
         | Cmd::Pause { .. }
         | Cmd::Resume { .. }
         | Cmd::Debug { .. } => unreachable!("handled above"),
-        Cmd::Start {
-            cart,
-            freerun: false,
-            ..
-        } => {
-            let panel = boot_cart(
-                target.panel,
-                target.workspace,
-                &target_root,
-                cart,
-                window,
-                cx,
-            )
-            .await?;
+        Cmd::Start { cart, freerun: false, .. } => {
+            let panel =
+                boot_cart(target.panel, target.workspace, &target_root, cart, window, cx).await?;
             // Arm the cart's inspection tap FIRST — only remote lock-step
             // runs serialize; the panel's own Run button never arms it.
             panel
@@ -1037,12 +955,8 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
             // the next boundary and settle: that parked frame is the
             // lock-step baseline.
             await_frame(&panel, cx, 1, std::time::Duration::from_secs(5)).await?;
-            panel
-                .update(cx, |p, _| p.remote_pause())
-                .map_err(|e| e.to_string())??;
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(60))
-                .await;
+            panel.update(cx, |p, _| p.remote_pause()).map_err(|e| e.to_string())??;
+            cx.background_executor().timer(std::time::Duration::from_millis(60)).await;
             let mut frame = panel
                 .update(cx, |p, _| p.remote_progress().0)
                 .map_err(|e| e.to_string())?;
@@ -1052,45 +966,23 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
                 // armed; one paused step produces the first dump (still
                 // null after that = cart built without the inspect
                 // feature).
-                panel
-                    .update(cx, |p, _| p.remote_step(1))
-                    .map_err(|e| e.to_string())??;
-                frame =
-                    await_frame(&panel, cx, frame + 1, std::time::Duration::from_secs(3)).await?;
+                panel.update(cx, |p, _| p.remote_step(1)).map_err(|e| e.to_string())??;
+                frame = await_frame(&panel, cx, frame + 1, std::time::Duration::from_secs(3)).await?;
                 world = world_value(&panel, cx);
             }
             Ok(serde_json::json!({ "started": true, "frame": frame, "world": world }))
         }
-        Cmd::Run { cart, .. }
-        | Cmd::Start {
-            cart,
-            freerun: true,
-            ..
-        } => {
+        Cmd::Run { cart, .. } | Cmd::Start { cart, freerun: true, .. } => {
             // The same boot as lock-step `Start`, minus the tap and the
             // pause: this run plays itself, and a delivered frame is all
             // the reply has to prove.
-            let panel = boot_cart(
-                target.panel,
-                target.workspace,
-                &target_root,
-                cart,
-                window,
-                cx,
-            )
-            .await?;
+            let panel =
+                boot_cart(target.panel, target.workspace, &target_root, cart, window, cx).await?;
             let frame = await_frame(&panel, cx, 1, std::time::Duration::from_secs(5)).await?;
             Ok(serde_json::json!({ "started": true, "frame": frame, "running": true }))
         }
-        Cmd::NextFrame {
-            buttons,
-            screenshot,
-            frames,
-            ..
-        } => {
-            let panel = target
-                .panel
-                .ok_or("no run in lock-step — emu_start first")?;
+        Cmd::NextFrame { buttons, screenshot, frames, .. } => {
+            let panel = target.panel.ok_or("no run in lock-step — emu_start first")?;
             let mask = buttons_to_mask(&buttons)?;
             let frames = frames.unwrap_or(1).clamp(1, MAX_STEP_FRAMES);
             let start = panel
@@ -1123,7 +1015,8 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
             // Like a remote boot, a remote flash must not need a human to
             // have opened the emulator first -- the run needs a panel to
             // live on, not a panel someone clicked.
-            let panel = panel_or_open(&target_root, target.panel, target.workspace, window, cx)?;
+            let panel =
+                panel_or_open(&target_root, target.panel, target.workspace, window, cx)?;
             // Returns as soon as the child is spawned: the reply says the
             // flash STARTED, and `flash_status` says how it is going.
             let effective = window
@@ -1147,20 +1040,15 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
             window
                 .update(cx, |_, window, app| {
                     workspace.update(app, |workspace, cx| {
-                        ggo_charts_panel::open_charts_item(
-                            workspace,
-                            window,
-                            cx,
-                            |charts, _, cx| {
-                                // `run` wins when both are given, matching the
-                                // bridge; the neither case returned above.
-                                if let Some(run) = run {
-                                    charts.open_run(run, cx);
-                                } else if let Some(fault) = opened {
-                                    charts.open_fault(fault, cx);
-                                }
-                            },
-                        );
+                        ggo_charts_panel::open_charts_item(workspace, window, cx, |charts, _, cx| {
+                            // `run` wins when both are given, matching the
+                            // bridge; the neither case returned above.
+                            if let Some(run) = run {
+                                charts.open_run(run, cx);
+                            } else if let Some(fault) = opened {
+                                charts.open_fault(fault, cx);
+                            }
+                        });
                     })
                 })
                 .map_err(|e| e.to_string())?;
@@ -1201,10 +1089,13 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
             })
             .detach();
             let timer = cx.background_executor().timer(HOST_PACK_TIMEOUT);
-            let outcome = smol::future::or(async { Some(wait.recv().await) }, async move {
-                timer.await;
-                None
-            })
+            let outcome = smol::future::or(
+                async { Some(wait.recv().await) },
+                async move {
+                    timer.await;
+                    None
+                },
+            )
             .await;
             let capture = match outcome {
                 Some(Ok(capture)) => capture,
@@ -1222,15 +1113,8 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
                     ggo_common::emd_failure_reason(&capture)
                 ));
             }
-            let tail: Vec<&String> = capture
-                .lines
-                .iter()
-                .rev()
-                .take(20)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
+            let tail: Vec<&String> =
+                capture.lines.iter().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect();
             Ok(serde_json::json!({ "cart": cart, "world": world, "lines": tail }))
         }
         Cmd::WorldList { .. } => {
@@ -1296,13 +1180,7 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
             };
             await_sprite_ready(&panel, cx, |p| p.remote_read()).await
         }
-        Cmd::SpriteClipCreate {
-            sprite,
-            name,
-            loop_,
-            entries,
-            ..
-        } => {
+        Cmd::SpriteClipCreate { sprite, name, loop_, entries, .. } => {
             let workspace = target.workspace.ok_or("workspace vanished")?;
             let panel = sprite_panel_open(&workspace, window, &sprite, cx)?.0;
             let entries: Vec<_> = entries.into_iter().map(clip_entry_from_arg).collect();
@@ -1311,22 +1189,11 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
             })
             .await
         }
-        Cmd::SpriteClipUpdate {
-            sprite,
-            clip,
-            name,
-            loop_,
-            entries,
-            ..
-        } => {
+        Cmd::SpriteClipUpdate { sprite, clip, name, loop_, entries, .. } => {
             let workspace = target.workspace.ok_or("workspace vanished")?;
             let panel = sprite_panel_open(&workspace, window, &sprite, cx)?.0;
-            let entries = entries.map(|entries| {
-                entries
-                    .into_iter()
-                    .map(clip_entry_from_arg)
-                    .collect::<Vec<_>>()
-            });
+            let entries =
+                entries.map(|entries| entries.into_iter().map(clip_entry_from_arg).collect::<Vec<_>>());
             let clip = clip_lookup(clip);
             await_sprite_ready_mut(&panel, cx, move |p, cx| {
                 p.remote_clip_update(clip.clone(), name.clone(), loop_, entries.clone(), cx)
@@ -1337,10 +1204,7 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
             let workspace = target.workspace.ok_or("workspace vanished")?;
             let panel = sprite_panel_open(&workspace, window, &sprite, cx)?.0;
             let clip = clip_lookup(clip);
-            await_sprite_ready_mut(&panel, cx, move |p, cx| {
-                p.remote_clip_delete(clip.clone(), cx)
-            })
-            .await
+            await_sprite_ready_mut(&panel, cx, move |p, cx| p.remote_clip_delete(clip.clone(), cx)).await
         }
         Cmd::SpriteSave { sprite, .. } => {
             let workspace = target.workspace.ok_or("workspace vanished")?;
@@ -1373,21 +1237,16 @@ async fn dispatch_inner(cmd: Cmd, cx: &mut AsyncApp) -> Result<serde_json::Value
                 await_sprite_ready(&panel, cx, |p| p.remote_tileset_image()).await?;
             let mut reply = bgra_reply(width, height, &bgra);
             if let Some(path) = path {
-                reply
-                    .as_object_mut()
-                    .expect("bgra_reply returns an object")
-                    .insert(
-                        "write_to".to_string(),
-                        serde_json::json!(resolve_write_path(&target_root, &path)),
-                    );
+                reply.as_object_mut().expect("bgra_reply returns an object").insert(
+                    "write_to".to_string(),
+                    serde_json::json!(resolve_write_path(&target_root, &path)),
+                );
             }
             Ok(reply)
         }
         Cmd::Stop { .. } => {
             let panel = target.panel.ok_or("no emu panel open in this workspace")?;
-            let uart = panel
-                .update(cx, |p, _| p.remote_uart(None))
-                .unwrap_or_default();
+            let uart = panel.update(cx, |p, _| p.remote_uart(None)).unwrap_or_default();
             window
                 .update(cx, |_, window, app| {
                     panel.update(app, |p, cx| p.remote_stop(window, cx)).ok();
@@ -1516,12 +1375,12 @@ mod tests {
         // A fake `emd`, so a regression registers a run here instead of
         // shelling out to the real binary.
         cx.update(|_, cx| {
-            cx.set_global(crate::viewer_run::TestViewerRunner(std::sync::Arc::new(
-                |_| ggo_common::ProcCapture {
+            cx.set_global(crate::viewer_run::TestViewerRunner(std::sync::Arc::new(|_| {
+                ggo_common::ProcCapture {
                     ok: false,
                     lines: vec!["no build in this test".to_string()],
-                },
-            )));
+                }
+            })));
             cx.set_global(crate::viewer_run::TestViewerRoot(dir.path().to_path_buf()));
         });
         let mut async_cx = cx.to_async();
@@ -1580,16 +1439,7 @@ mod tests {
             tile_count: 2,
             session_tiles: std::collections::HashSet::new(),
             palette,
-            frames: vec![
-                Frame {
-                    offset: (0, 0),
-                    map: vec![0],
-                },
-                Frame {
-                    offset: (0, 0),
-                    map: vec![1],
-                },
-            ],
+            frames: vec![Frame { offset: (0, 0), map: vec![0] }, Frame { offset: (0, 0), map: vec![1] }],
             clips: vec![],
             w_tiles: 1,
             h_tiles: 1,
@@ -1620,10 +1470,7 @@ mod tests {
         let mut async_cx = cx.to_async();
 
         let opened = dispatch_inner(
-            Cmd::SpriteOpen {
-                workspace: None,
-                sprite: "sprites/hero".to_string(),
-            },
+            Cmd::SpriteOpen { workspace: None, sprite: "sprites/hero".to_string() },
             &mut async_cx,
         )
         .await
@@ -1632,23 +1479,15 @@ mod tests {
         cx.run_until_parked();
         workspace.read_with(cx, |workspace, cx| {
             assert_eq!(
-                workspace
-                    .items_of_type::<ggo_sprite_panel::SpriteEditorItem>(cx)
-                    .count(),
+                workspace.items_of_type::<ggo_sprite_panel::SpriteEditorItem>(cx).count(),
                 1,
                 "the open gave the sprite its own center tab"
             );
         });
 
-        let read = dispatch_inner(
-            Cmd::SpriteRead {
-                workspace: None,
-                sprite: None,
-            },
-            &mut async_cx,
-        )
-        .await
-        .expect("sprite_read answers from the tab sprite_open left active");
+        let read = dispatch_inner(Cmd::SpriteRead { workspace: None, sprite: None }, &mut async_cx)
+            .await
+            .expect("sprite_read answers from the tab sprite_open left active");
         assert_eq!(read["rel_path"], "sprites/hero.spr");
         assert_eq!(read["frame_count"], 2);
         assert_eq!(read["dirty"], false);
@@ -1668,10 +1507,7 @@ mod tests {
 
         for _ in 0..2 {
             dispatch_inner(
-                Cmd::SpriteOpen {
-                    workspace: None,
-                    sprite: "sprites/hero".to_string(),
-                },
+                Cmd::SpriteOpen { workspace: None, sprite: "sprites/hero".to_string() },
                 &mut async_cx,
             )
             .await
@@ -1680,9 +1516,7 @@ mod tests {
         }
         workspace.read_with(cx, |workspace, cx| {
             assert_eq!(
-                workspace
-                    .items_of_type::<ggo_sprite_panel::SpriteEditorItem>(cx)
-                    .count(),
+                workspace.items_of_type::<ggo_sprite_panel::SpriteEditorItem>(cx).count(),
                 1,
                 "the second open focused the same tab"
             );
@@ -1723,10 +1557,7 @@ mod tests {
         assert_eq!(created["entries"][0]["duration_ms"], 80);
 
         let read = dispatch_inner(
-            Cmd::SpriteRead {
-                workspace: None,
-                sprite: Some("sprites/hero".to_string()),
-            },
+            Cmd::SpriteRead { workspace: None, sprite: Some("sprites/hero".to_string()) },
             &mut async_cx,
         )
         .await
@@ -1762,27 +1593,19 @@ mod tests {
         assert_eq!(deleted["index"], 0);
         assert_eq!(deleted["name"], "run");
 
-        let read = dispatch_inner(
-            Cmd::SpriteRead {
-                workspace: None,
-                sprite: None,
-            },
-            &mut async_cx,
-        )
-        .await
-        .expect("sprite_read");
-        assert_eq!(
-            read["clips"].as_array().unwrap().len(),
-            0,
-            "the delete landed"
-        );
+        let read = dispatch_inner(Cmd::SpriteRead { workspace: None, sprite: None }, &mut async_cx)
+            .await
+            .expect("sprite_read");
+        assert_eq!(read["clips"].as_array().unwrap().len(), 0, "the delete landed");
     }
 
     /// `sprite_clip_update`/`sprite_clip_delete` naming a clip index out
     /// of range, or a name shared by two clips, must error rather than
     /// guess.
     #[gpui::test]
-    async fn sprite_clip_update_rejects_a_bad_index_and_an_ambiguous_name(cx: &mut TestAppContext) {
+    async fn sprite_clip_update_rejects_a_bad_index_and_an_ambiguous_name(
+        cx: &mut TestAppContext,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("emerald.toml"), "[project]\n").unwrap();
         write_sprite_fixture_named(dir.path(), "hero");
@@ -1859,25 +1682,16 @@ mod tests {
         .expect("sprite_clip_create");
 
         let saved = dispatch_inner(
-            Cmd::SpriteSave {
-                workspace: None,
-                sprite: "sprites/hero".to_string(),
-            },
+            Cmd::SpriteSave { workspace: None, sprite: "sprites/hero".to_string() },
             &mut async_cx,
         )
         .await
         .expect("sprite_save");
         assert_eq!(saved["saved"], "sprites/hero.spr");
 
-        let read = dispatch_inner(
-            Cmd::SpriteRead {
-                workspace: None,
-                sprite: None,
-            },
-            &mut async_cx,
-        )
-        .await
-        .expect("sprite_read");
+        let read = dispatch_inner(Cmd::SpriteRead { workspace: None, sprite: None }, &mut async_cx)
+            .await
+            .expect("sprite_read");
         assert_eq!(read["dirty"], false, "the save cleared dirty");
 
         let reopened = ggo_worldlib::sprites::io::open_sprite(dir.path(), "sprites/hero.spr")
@@ -1895,9 +1709,8 @@ mod tests {
         let (_workspace, cx) = remote_workspace(cx, dir.path()).await;
         let mut async_cx = cx.to_async();
 
-        let listed = dispatch_inner(Cmd::SpriteList { workspace: None }, &mut async_cx)
-            .await
-            .expect("sprite_list");
+        let listed =
+            dispatch_inner(Cmd::SpriteList { workspace: None }, &mut async_cx).await.expect("sprite_list");
         let stems: Vec<&str> = listed["sprites"]
             .as_array()
             .unwrap()
@@ -2004,21 +1817,9 @@ mod tests {
     fn resolve_workspace_exact_single_and_ambiguous() {
         let keys = vec!["/a".to_string(), "/b".to_string()];
         assert_eq!(resolve_workspace(&keys, Some("/b")).unwrap(), "/b");
-        assert!(
-            resolve_workspace(&keys, Some("/c"))
-                .unwrap_err()
-                .contains("no workspace")
-        );
-        assert!(
-            resolve_workspace(&keys, None)
-                .unwrap_err()
-                .contains("multiple workspaces")
-        );
+        assert!(resolve_workspace(&keys, Some("/c")).unwrap_err().contains("no workspace"));
+        assert!(resolve_workspace(&keys, None).unwrap_err().contains("multiple workspaces"));
         assert_eq!(resolve_workspace(&keys[..1], None).unwrap(), "/a");
-        assert!(
-            resolve_workspace(&[], None)
-                .unwrap_err()
-                .contains("no emu panel")
-        );
+        assert!(resolve_workspace(&[], None).unwrap_err().contains("no emu panel"));
     }
 }
