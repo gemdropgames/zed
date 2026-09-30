@@ -7360,12 +7360,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ggo-emu-abi"
+version = "0.1.0"
+
+[[package]]
 name = "ggo-emu-core"
 version = "0.1.0"
 dependencies = [
  "gemdrop-sdk",
  "ggo-asset-formats",
+ "ggo-emu-abi",
  "ggo-hal",
+ "ggo-savefile",
  "ggo-wire",
 ]
 
@@ -7376,6 +7382,10 @@ dependencies = [
  "ggo-asset-formats",
  "ggo-wire",
 ]
+
+[[package]]
+name = "ggo-savefile"
+version = "0.1.0"
 
 [[package]]
 name = "ggo-wire"
@@ -7539,6 +7549,7 @@ dependencies = [
  "ggo_common",
  "ggo_daemon_client",
  "ggo_emu_remote",
+ "ggo_emu_wasm",
  "ggo_sprite_panel",
  "ggo_world_panel",
  "gpui",
@@ -7568,6 +7579,22 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "ggo_emu_wasm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ggo-emu-abi",
+ "ggo-emu-core",
+ "gpui",
+ "log",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "util",
+ "wasmtime",
 ]
 
 [[package]]

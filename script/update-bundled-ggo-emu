@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Rebuild ggo_emu.wasm from the sibling ggo checkout and bundle it into zed.
+set -euo pipefail
+here="$(cd "$(dirname "$0")/.." && pwd)"
+ggo="${GGO_REPO:-$here/../ggo}"
+(cd "$ggo/tools" && nice -n 19 ionice -c2 -n7 cargo build -p ggo-emu --lib --release --target wasm32-unknown-unknown)
+mkdir -p "$here/crates/ggo/emu_wasm/bundled"
+cp "$ggo/tools/target/wasm32-unknown-unknown/release/ggo_emu.wasm" "$here/crates/ggo/emu_wasm/bundled/ggo_emu.wasm"
+echo "bundled ggo_emu.wasm from $(git -C "$ggo" rev-parse --short HEAD)"

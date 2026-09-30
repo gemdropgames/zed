@@ -15,7 +15,7 @@ workspace = true
 # row) is private -- the same reason `ggo_map_panel`/`ggo_world_panel`
 # carry this feature. It also re-exports `drive::fixture`, since there is
 # no committed `.cart` in the fork for another crate to open.
-test-support = []
+test-support = ["ggo_emu_wasm/test-support"]
 
 [lib]
 path = "src/ggo_emu_panel.rs"
@@ -51,6 +51,7 @@ project.workspace = true
 serde_json.workspace = true
 smol.workspace = true # GGO -- `yield_now` between pumped frames, see `EmuPanel::run`
 base64.workspace = true # GGO -- remote screenshot payloads, see `remote`
+ggo_emu_wasm.workspace = true # GGO -- the fixture carts live there
 ggo_emu_remote.workspace = true # GGO -- agent remote-control protocol/registry
 ui.workspace = true
 util.workspace = true
@@ -66,6 +67,7 @@ libc.workspace = true
 # reads them back the way the panel does: over the in-process daemon.
 ggo-db.workspace = true
 ggo_daemon_client = { workspace = true, features = ["test-support"] }
+ggo_emu_wasm = { workspace = true, features = ["test-support"] }
 # The link tests stage cart -> host bytes the way `ggo-emu-core`'s own
 # runtime tests do -- a real `COMM_SEND` ecall -- so they need the
 # syscall number. Dev-only: nothing in the panel itself names the SDK.
