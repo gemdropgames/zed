@@ -932,7 +932,17 @@ impl AudioPanel {
                 }
             },
             Mode::Baked => match &open.baked {
-                Some(blob) => Spec::Baked(blob.clone()),
+                Some(blob) => match ggo_emu_panel::current_emulator(cx) {
+                    Ok(emulator) => Spec::Baked {
+                        blob: blob.clone(),
+                        emulator,
+                    },
+                    Err(error) => {
+                        open.error = Some(format!("no emulator module to preview with: {error:#}"));
+                        cx.notify();
+                        return;
+                    }
+                },
                 None => {
                     open.error = Some("still baking — try again in a moment".to_string());
                     cx.notify();
@@ -940,18 +950,10 @@ impl AudioPanel {
                 }
             },
         };
-        let emulator = match ggo_emu_panel::current_emulator(cx) {
-            Ok(emulator) => emulator,
-            Err(error) => {
-                open.error = Some(format!("no emulator module to preview with: {error:#}"));
-                cx.notify();
-                return;
-            }
-        };
         open.error = None;
         let looping = open.looping;
         self.status.reset_for_run();
-        self.preview = Some(Preview::start(spec, looping, self.status.clone(), emulator));
+        self.preview = Some(Preview::start(spec, looping, self.status.clone()));
         // Redraw the playhead until the thread reports done.
         self._playhead_task = Some(cx.spawn(async move |this, cx| {
             loop {

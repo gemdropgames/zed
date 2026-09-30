@@ -32,7 +32,10 @@ use ggo_emu_wasm::{LoadedEmulator, WasmApu};
 pub enum Spec {
     Source(Arc<Decoded>),
     /// A whole `.adp` (header + blocks).
-    Baked(Arc<Vec<u8>>),
+    Baked {
+        blob: Arc<Vec<u8>>,
+        emulator: Arc<LoadedEmulator>,
+    },
 }
 
 /// Progress is published as a fraction scaled by this.
@@ -58,12 +61,7 @@ pub struct Preview {
 }
 
 impl Preview {
-    pub fn start(
-        spec: Spec,
-        looping: bool,
-        status: AudioStatus,
-        emulator: Arc<LoadedEmulator>,
-    ) -> Preview {
+    pub fn start(spec: Spec, looping: bool, status: AudioStatus) -> Preview {
         let stop = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(AtomicU32::new(0));
         let done = Arc::new(AtomicBool::new(false));
@@ -75,21 +73,13 @@ impl Preview {
                     let (mut writer, reader) = audio::channel(status.clone());
                     let mix_rate = match &spec {
                         Spec::Source(decoded) => decoded.rate_hz,
-                        Spec::Baked(_) => MIX_RATE,
+                        Spec::Baked { .. } => MIX_RATE,
                     };
                     // Held for the thread's life: dropping it closes the
                     // device. `None` (no device) plays silently, which is
                     // the emulator pane's rule too.
                     let _out = audio::start_output(&status, reader, mix_rate);
-                    run(
-                        &spec,
-                        looping,
-                        &mut writer,
-                        &stop,
-                        &progress,
-                        true,
-                        &emulator,
-                    );
+                    run(&spec, looping, &mut writer, &stop, &progress, true);
                     done.store(true, Ordering::Release);
                 }
             });
@@ -150,11 +140,12 @@ pub(crate) fn run(
     stop: &AtomicBool,
     progress: &AtomicU32,
     pace: bool,
-    emulator: &LoadedEmulator,
 ) {
     match spec {
         Spec::Source(decoded) => run_source(decoded, looping, sink, stop, progress, pace),
-        Spec::Baked(blob) => run_baked(blob, looping, sink, stop, progress, pace, emulator),
+        Spec::Baked { blob, emulator } => {
+            run_baked(blob, emulator, looping, sink, stop, progress, pace)
+        }
     }
 }
 
@@ -225,12 +216,12 @@ fn run_source(
 
 fn run_baked(
     blob: &[u8],
+    emulator: &LoadedEmulator,
     looping: bool,
     sink: &mut dyn Sink,
     stop: &AtomicBool,
     progress: &AtomicU32,
     pace: bool,
-    emulator: &LoadedEmulator,
 ) {
     let Some((header, blocks)) = ggo_asset_formats::parse_adp(blob) else {
         return;
@@ -386,13 +377,15 @@ mod tests {
         let stop = AtomicBool::new(false);
         let progress = AtomicU32::new(0);
         run(
-            &Spec::Baked(blob),
+            &Spec::Baked {
+                blob,
+                emulator: test_emulator(),
+            },
             false,
             &mut out,
             &stop,
             &progress,
             false,
-            &test_emulator(),
         );
         // One second at the 32 kHz mix = ~64k interleaved samples, plus
         // the drain frames of silence.
@@ -417,13 +410,15 @@ mod tests {
         };
         let progress = AtomicU32::new(0);
         run(
-            &Spec::Baked(blob),
+            &Spec::Baked {
+                blob,
+                emulator: test_emulator(),
+            },
             true,
             &mut sink,
             &stop,
             &progress,
             false,
-            &test_emulator(),
         );
         assert_eq!(
             sink.pushes, 120,
@@ -447,7 +442,6 @@ mod tests {
             &stop,
             &progress,
             false,
-            &test_emulator(),
         );
         assert_eq!(out.len(), 1200, "every mono sample becomes an L/R pair");
         assert_eq!(&out[0..2], &[decoded.samples[0], decoded.samples[0]]);
@@ -460,13 +454,15 @@ mod tests {
         let stop = AtomicBool::new(false);
         let progress = AtomicU32::new(0);
         run(
-            &Spec::Baked(Arc::new(b"nope".to_vec())),
+            &Spec::Baked {
+                blob: Arc::new(b"nope".to_vec()),
+                emulator: test_emulator(),
+            },
             false,
             &mut out,
             &stop,
             &progress,
             false,
-            &test_emulator(),
         );
         let empty = Arc::new(Decoded {
             samples: vec![],
@@ -480,7 +476,6 @@ mod tests {
             &stop,
             &progress,
             false,
-            &test_emulator(),
         );
         assert!(out.is_empty());
     }
