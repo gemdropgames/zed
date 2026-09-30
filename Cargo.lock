@@ -7586,9 +7586,12 @@ name = "ggo_emu_wasm"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "fs",
+ "futures 0.3.32",
  "ggo-emu-abi",
  "ggo-emu-core",
  "gpui",
+ "http_client",
  "log",
  "serde",
  "serde_json",

@@ -20,6 +20,7 @@ use wasmtime::{Caller, Engine, Instance, Linker, Memory, Module, Store, TypedFun
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod fixture;
+pub mod sources;
 
 pub const REQUIRED_ABI_MAJOR: u16 = 1;
 pub const MIN_ABI_MINOR: u16 = 0;
