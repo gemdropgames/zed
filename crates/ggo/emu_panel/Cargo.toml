@@ -32,6 +32,7 @@ cpal.workspace = true
 # GGO -- `Shared`, so every world tab of one emerald project waits on the
 # same `emd editor-cart` build. See `viewer_run::shared_build`.
 futures.workspace = true
+fuzzy.workspace = true # GGO -- the emulator picker's row filter
 ggo-comm.workspace = true # GGO -- MessageReader over the cart's comm TX
 ggo-emu-abi.workspace = true # GGO -- PPU/APU constants and `PpuSnapshot`, shared with the wasm module
 ggo-savefile.workspace = true # GGO -- save-file location and flush, host side
@@ -48,6 +49,7 @@ ggo-worldlib.workspace = true
 gpui.workspace = true
 image.workspace = true
 log.workspace = true # GGO -- R6: the cpal stream-error callback runs on a realtime audio thread, so it reports rather than panics
+picker.workspace = true # GGO -- the emulator version picker
 project.workspace = true
 serde_json.workspace = true
 smol.workspace = true # GGO -- `yield_now` between pumped frames, see `EmuPanel::run`

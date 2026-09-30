@@ -151,6 +151,10 @@ impl EmuRuntime {
         &self.config
     }
 
+    pub fn config_path(&self) -> &Path {
+        &self.config_path
+    }
+
     pub fn source(&self) -> Arc<dyn EmulatorSource> {
         source_for(&self.config.source, self.fs.clone(), self.http.clone())
     }

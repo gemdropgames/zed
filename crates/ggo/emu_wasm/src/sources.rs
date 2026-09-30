@@ -280,21 +280,23 @@ async fn get_bytes(
     Ok(body)
 }
 
+/// Forgejo's releases listing as the picker and source tests serve it.
+#[cfg(any(test, feature = "test-support"))]
+pub const RELEASES: &str = r#"[
+  {"tag_name":"v0.3.0-rc1","draft":false,"prerelease":true,
+   "assets":[{"name":"ggo_emu.wasm","browser_download_url":"https://git.example/dl/rc1.wasm"}]},
+  {"tag_name":"v0.2.0","draft":false,"prerelease":false,
+   "assets":[{"name":"ggo_emu.wasm","browser_download_url":"https://git.example/dl/v020.wasm"}]},
+  {"tag_name":"v0.1.9","draft":true,"prerelease":false,
+   "assets":[{"name":"ggo_emu.wasm","browser_download_url":"https://git.example/dl/draft.wasm"}]},
+  {"tag_name":"v0.1.0","draft":false,"prerelease":false,
+   "assets":[{"name":"other.bin","browser_download_url":"https://git.example/dl/other.bin"}]}
+]"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use http_client::FakeHttpClient;
-
-    const RELEASES: &str = r#"[
-      {"tag_name":"v0.3.0-rc1","draft":false,"prerelease":true,
-       "assets":[{"name":"ggo_emu.wasm","browser_download_url":"https://git.example/dl/rc1.wasm"}]},
-      {"tag_name":"v0.2.0","draft":false,"prerelease":false,
-       "assets":[{"name":"ggo_emu.wasm","browser_download_url":"https://git.example/dl/v020.wasm"}]},
-      {"tag_name":"v0.1.9","draft":true,"prerelease":false,
-       "assets":[{"name":"ggo_emu.wasm","browser_download_url":"https://git.example/dl/draft.wasm"}]},
-      {"tag_name":"v0.1.0","draft":false,"prerelease":false,
-       "assets":[{"name":"other.bin","browser_download_url":"https://git.example/dl/other.bin"}]}
-    ]"#;
 
     fn forgejo(tag: &str) -> ForgejoSource {
         let http = FakeHttpClient::create(|request| async move {

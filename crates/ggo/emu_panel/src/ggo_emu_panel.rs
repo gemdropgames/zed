@@ -80,6 +80,7 @@ pub mod audio;
 mod debug;
 mod drive;
 mod emu_item;
+mod emulator_picker;
 mod hardware;
 mod hardware_item;
 mod ingest;
@@ -131,7 +132,9 @@ actions!(
         /// While paused, runs exactly one more frame (pauses first if running).
         StepFrame,
         /// Shows or hides the debug column (tiles, tilemap, OAM, palettes).
-        ToggleDebug
+        ToggleDebug,
+        /// Picks which emulator module (bundled, local file, Forgejo release, URL) to run.
+        SelectEmulatorVersion
     ]
 );
 
@@ -288,6 +291,20 @@ pub fn init(cx: &mut App) {
     // Agent remote-control host (unix socket + on-disk advertisement) --
     // see `agent_remote`'s module doc.
     agent_remote::init(cx);
+
+    cx.observe_new(|workspace: &mut Workspace, _, _| {
+        workspace.register_action(|workspace, _: &SelectEmulatorVersion, window, cx| {
+            let Some(runtime) = ggo_emu_wasm::EmuRuntime::global(cx) else {
+                log::error!("select emulator version: the emulator runtime is not initialized");
+                return;
+            };
+            let weak_workspace = workspace.weak_handle();
+            workspace.toggle_modal(window, cx, |window, cx| {
+                emulator_picker::EmulatorPicker::new(runtime, weak_workspace, window, cx)
+            });
+        });
+    })
+    .detach();
 
     // Explorer-driven routing: clicking a `.cart` in the project panel
     // selects it HERE instead of opening a (binary, unreadable) editor tab.
